@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFileDialog,
-    QFormLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -22,19 +21,26 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QSpinBox,
     QSplitter,
     QTabWidget,
     QTextBrowser,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from pdf2epub.application.commands import CommandResult, StructureCommandService
 from pdf2epub.application.editing import DocumentEditor
 from pdf2epub.application.parsing import BatchParseSummary, ParseProgress, reparse_conflict
+from pdf2epub.application.region_reparse import RegionCandidate, RegionReparseService
+from pdf2epub.application.warnings import (
+    acknowledge_warning,
+    active_export_warnings,
+    provenance_view,
+)
 from pdf2epub.application.workflow import BookWorkflow
+from pdf2epub.domain.errors import TranslationConflictError
 from pdf2epub.domain.models import (
+    BBox,
     BookDocument,
     CaptionBlock,
     HeadingBlock,
@@ -47,7 +53,10 @@ from pdf2epub.epub.builder import EpubBuilder, EpubBuildOptions
 from pdf2epub.epub.validator import EpubValidator
 from pdf2epub.epub.xhtml import preview_html
 from pdf2epub.gui.page_view import PdfPageView
+from pdf2epub.gui.provenance_inspector import ProvenanceInspector
+from pdf2epub.gui.structure_workbench import StructureWorkbench
 from pdf2epub.gui.translation_view import TranslationView
+from pdf2epub.gui.warning_center import WarningCenter
 from pdf2epub.gui.workers import AsyncProgressWorker, FunctionWorker, ProgressWorker
 from pdf2epub.parsers.base import OcrParseOptions, ParseOptions
 from pdf2epub.parsers.paddle_structure import (
@@ -101,6 +110,14 @@ class MainWindow(QMainWindow):
         self.project = project
         self.workflow = workflow or BookWorkflow()
         self.editor_service = DocumentEditor()
+        self.command_service = StructureCommandService(
+            store=self.workflow.store,
+            editor=self.editor_service,
+        )
+        self.region_service = RegionReparseService(
+            self.workflow.registry,
+            store=self.workflow.store,
+        )
         self.epubcheck_jar = epubcheck_jar
         self.translator_factory = translator_factory or LongCatProvider
         self.require_translation_consent = require_translation_consent
@@ -112,12 +129,14 @@ class MainWindow(QMainWindow):
         self._current_image_path: str | None = None
         self._page_loading = False
         self._pending_page_index: int | None = None
+        self._pending_block_selection: str | None = None
         self._active_workers: set[FunctionWorker | ProgressWorker | AsyncProgressWorker] = set()
         self.setWindowTitle(f"pdf2epub — {project.document.metadata.title}")
         self.resize(1280, 800)
         self._build_ui()
         self._refresh_page_list()
         self.translation_view.refresh(self.project.document)
+        self.warning_center.refresh(self.project.document)
         self._refresh_preview()
         if self.project.document.pages:
             self.page_list.setCurrentRow(0)
@@ -158,6 +177,7 @@ class MainWindow(QMainWindow):
         self.page_view = PdfPageView()
         self.page_view.setObjectName("pdfPageView")
         self.page_view.block_clicked.connect(self._select_block_by_id)
+        self.page_view.region_selected.connect(self._region_selected)
         splitter.addWidget(self.page_view)
 
         self.tabs = QTabWidget()
@@ -177,6 +197,12 @@ class MainWindow(QMainWindow):
         self.logs.setReadOnly(True)
         self.logs.setObjectName("logs")
         self.tabs.addTab(self.logs, "Logs")
+        self.provenance_inspector = ProvenanceInspector()
+        self.tabs.addTab(self.provenance_inspector, "Provenance")
+        self.warning_center = WarningCenter()
+        self.warning_center.navigate_requested.connect(self._navigate_warning)
+        self.warning_center.acknowledge_requested.connect(self._acknowledge_warning)
+        self.tabs.addTab(self.warning_center, "Warnings")
         splitter.addWidget(self.tabs)
         splitter.setSizes([190, 590, 500])
         root_layout.addWidget(splitter)
@@ -201,35 +227,19 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(status_row)
         self.setCentralWidget(central)
 
-    def _structure_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        self.block_list = QListWidget()
-        self.block_list.setObjectName("blockList")
+    def _structure_tab(self) -> StructureWorkbench:
+        widget = StructureWorkbench()
+        self.block_list = widget.block_list
+        self.text_editor = widget.text_editor
+        self.type_combo = widget.type_combo
+        self.heading_level = widget.heading_level
         self.block_list.currentRowChanged.connect(self._block_selected)
-        layout.addWidget(self.block_list, 2)
-        self.text_editor = QTextEdit()
-        self.text_editor.setObjectName("textEditor")
-        layout.addWidget(self.text_editor, 1)
-        form = QFormLayout()
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["paragraph", "heading"])
-        self.heading_level = QSpinBox()
-        self.heading_level.setRange(1, 6)
-        form.addRow("Block type", self.type_combo)
-        form.addRow("Heading level", self.heading_level)
-        layout.addLayout(form)
-        buttons = QHBoxLayout()
-        apply_button = QPushButton("Apply Edit")
-        apply_button.clicked.connect(self.apply_edit)
-        merge_button = QPushButton("Merge Next")
-        merge_button.clicked.connect(self.merge_next)
-        split_button = QPushButton("Split at Cursor")
-        split_button.clicked.connect(self.split_at_cursor)
-        buttons.addWidget(apply_button)
-        buttons.addWidget(merge_button)
-        buttons.addWidget(split_button)
-        layout.addLayout(buttons)
+        widget.apply_requested.connect(self.apply_edit)
+        widget.merge_requested.connect(self.merge_next)
+        widget.split_requested.connect(self.split_at_cursor)
+        widget.undo_requested.connect(self.undo_structure)
+        widget.redo_requested.connect(self.redo_structure)
+        widget.region_requested.connect(self.begin_region_selection)
         return widget
 
     def _selected_page_indexes(self) -> list[int]:
@@ -254,6 +264,7 @@ class MainWindow(QMainWindow):
         if not isinstance(result, LoadedProject):
             raise TypeError("Unexpected analysis result")
         self.project = result
+        self._clear_structure_history()
         self._set_parsing_busy(False, "Page classification updated")
         self._refresh_page_list()
         self.document_changed.emit()
@@ -270,6 +281,7 @@ class MainWindow(QMainWindow):
             indexes,
             override,  # type: ignore[arg-type]
         )
+        self._clear_structure_history()
         self._refresh_page_list()
         self.status_label.setText(f"Updated parser override for {len(indexes)} page(s)")
         self.document_changed.emit()
@@ -397,6 +409,7 @@ class MainWindow(QMainWindow):
         if not isinstance(result, PageBatchResult):
             raise TypeError("Unexpected page parse result")
         self.project = result.project
+        self._clear_structure_history()
         summary = result.summary
         self._set_parsing_busy(False, "Page parsing finished")
         self._refresh_page_list()
@@ -519,6 +532,10 @@ class MainWindow(QMainWindow):
         self._current_image_path = result.image_path
         self.page_view.show_page(result.image_path, page)
         self._refresh_blocks()
+        if self._pending_block_selection is not None:
+            block_id = self._pending_block_selection
+            self._pending_block_selection = None
+            self._select_block_by_id(block_id)
         self._refresh_page_list()
         self.translation_view.refresh(self.project.document)
         self._refresh_preview()
@@ -548,6 +565,11 @@ class MainWindow(QMainWindow):
             item.setData(256, block.id)
             self.block_list.addItem(item)
         self.block_list.blockSignals(False)
+        self.warning_center.refresh(self.project.document)
+        error = self.region_service.capability_error(page)
+        self.structure_widget.region_button.setEnabled(error is None and not self._active_workers)
+        self.structure_widget.region_button.setToolTip(error or "Reparse a selected OCR region")
+        self._refresh_history_buttons()
         if self.block_list.count():
             self.block_list.setCurrentRow(0)
 
@@ -568,10 +590,11 @@ class MainWindow(QMainWindow):
             return
         self.text_editor.setEnabled(True)
         self.text_editor.setPlainText(block.effective_text)
-        self.type_combo.setCurrentText(
-            block.type if not isinstance(block, CaptionBlock) else "paragraph"
-        )
+        self.type_combo.setCurrentText(block.type)
+        self.type_combo.setEnabled(not isinstance(block, CaptionBlock))
+        self.heading_level.setEnabled(isinstance(block, HeadingBlock))
         self.heading_level.setValue(block.level if isinstance(block, HeadingBlock) else 1)
+        self.provenance_inspector.show_provenance(provenance_view(self.project.document, block.id))
 
     def _select_block_by_id(self, block_id: str) -> None:
         for row in range(self.block_list.count()):
@@ -582,51 +605,244 @@ class MainWindow(QMainWindow):
     def apply_edit(self) -> None:
         if self.current_block_id is None:
             return
-        document = self.editor_service.edit_text(
-            self.project.document,
-            self.current_page_index,
-            self.current_block_id,
-            self.text_editor.toPlainText(),
-        )
-        document = self.editor_service.change_type(
-            document,
-            self.current_page_index,
-            self.current_block_id,
-            self.type_combo.currentText(),
-            self.heading_level.value(),
-        )
-        self._commit_document(document, self.current_block_id)
+        kwargs = {
+            "text": self.text_editor.toPlainText(),
+            "block_type": self.type_combo.currentText(),
+            "heading_level": self.heading_level.value(),
+        }
+        try:
+            result = self.command_service.execute_edit(
+                self.project,
+                self.current_page_index,
+                self.current_block_id,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        except TranslationConflictError as exc:
+            if not self._confirm_translation_loss(str(exc)):
+                return
+            result = self.command_service.execute_edit(
+                self.project,
+                self.current_page_index,
+                self.current_block_id,
+                **kwargs,  # type: ignore[arg-type]
+                confirm_translation_loss=True,
+            )
+        self._accept_command_result(result)
 
     def merge_next(self) -> None:
         if self.current_block_id is None:
             return
-        document = self.editor_service.merge_adjacent(
-            self.project.document, self.current_page_index, self.current_block_id
-        )
-        previous_ids = {block.id for block in self._current_page().blocks}
-        new_page = next(
-            page for page in document.pages if page.page_index == self.current_page_index
-        )
-        merged_id = next(block.id for block in new_page.blocks if block.id not in previous_ids)
-        self._commit_document(document, merged_id)
+        try:
+            result = self.command_service.execute_merge(
+                self.project, self.current_page_index, self.current_block_id
+            )
+        except TranslationConflictError as exc:
+            if not self._confirm_translation_loss(str(exc)):
+                return
+            result = self.command_service.execute_merge(
+                self.project,
+                self.current_page_index,
+                self.current_block_id,
+                confirm_translation_loss=True,
+            )
+        self._accept_command_result(result)
 
     def split_at_cursor(self) -> None:
         if self.current_block_id is None:
             return
         offset = self.text_editor.textCursor().position()
-        document = self.editor_service.split_block(
-            self.project.document, self.current_page_index, self.current_block_id, offset
+        try:
+            result = self.command_service.execute_split(
+                self.project, self.current_page_index, self.current_block_id, offset
+            )
+        except TranslationConflictError as exc:
+            if not self._confirm_translation_loss(str(exc)):
+                return
+            result = self.command_service.execute_split(
+                self.project,
+                self.current_page_index,
+                self.current_block_id,
+                offset,
+                confirm_translation_loss=True,
+            )
+        self._accept_command_result(result)
+
+    def undo_structure(self) -> None:
+        try:
+            result = self.command_service.undo(self.project)
+        except (KeyError, ValueError) as exc:
+            QMessageBox.warning(self, "pdf2epub", str(exc))
+            self._clear_structure_history()
+            return
+        self._accept_command_result(result)
+
+    def redo_structure(self) -> None:
+        try:
+            result = self.command_service.redo(self.project)
+        except (KeyError, ValueError) as exc:
+            QMessageBox.warning(self, "pdf2epub", str(exc))
+            self._clear_structure_history()
+            return
+        self._accept_command_result(result)
+
+    def _accept_command_result(self, result: CommandResult) -> None:
+        self.project = result.project
+        self._reload_current_page_view()
+        if result.selected_block_id is not None:
+            self._select_block_by_id(result.selected_block_id)
+        self._refresh_preview()
+        self.translation_view.refresh(self.project.document)
+        self.warning_center.refresh(self.project.document)
+        self._refresh_page_list()
+        self.document_changed.emit()
+        self.status_label.setText(f"Structure command saved ({result.translation_disposition})")
+
+    def begin_region_selection(self) -> None:
+        page = self._current_page()
+        if error := self.region_service.capability_error(page):
+            QMessageBox.information(self, "Region OCR unavailable", error)
+            return
+        self.page_view.set_region_selection_enabled(True)
+        self.status_label.setText("Drag a rectangle covering at least half of an existing block")
+
+    def _region_selected(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        if self._active_workers:
+            return
+        region = BBox(x0=x0, y0=y0, x1=x1, y1=y1)
+        options = self._parse_options_for([self.current_page_index])
+        if options is None:
+            return
+        batch_project = self.project
+        page_index = self.current_page_index
+        self.cancel_event.clear()
+        self._set_parsing_busy(True, "Parsing selected OCR region…")
+
+        def task() -> RegionCandidate:
+            return self.region_service.build_candidate(
+                batch_project,
+                page_index,
+                region,
+                options=options,
+                cancelled=self.cancel_event.is_set,
+            )
+
+        self._start_worker(task, self._region_candidate_ready)
+
+    def _region_candidate_ready(self, result: object) -> None:
+        if not isinstance(result, RegionCandidate):
+            raise TypeError("Unexpected region candidate")
+        self._set_parsing_busy(False, "Region OCR candidate ready")
+        warning_text = f", {len(result.warnings)} warning(s)" if result.warnings else ""
+        cache_text = "cache hit" if result.cache_hit else "new inference"
+        current_page = self._current_page()
+        candidate_page = next(
+            page for page in result.document.pages if page.page_index == result.page_index
         )
-        previous_ids = {block.id for block in self._current_page().blocks}
-        new_page = next(
-            page for page in document.pages if page.page_index == self.current_page_index
+        replaced = [block for block in current_page.blocks if block.id in result.replaced_block_ids]
+        candidates = [
+            block for block in candidate_page.blocks if block.id in result.candidate_block_ids
+        ]
+        diff = (
+            "\n\nCurrent blocks:\n"
+            + "\n".join(f"  - {self._region_block_summary(block)}" for block in replaced)
+            + "\n\nCandidate blocks:\n"
+            + "\n".join(f"  + {self._region_block_summary(block)}" for block in candidates)
         )
-        first_new = next(block.id for block in new_page.blocks if block.id not in previous_ids)
-        self._commit_document(document, first_new)
+        answer = QMessageBox.question(
+            self,
+            "Replace selected region?",
+            f"Replace {len(result.replaced_block_ids)} block(s) with "
+            f"{len(result.candidate_block_ids)} candidate block(s) "
+            f"({cache_text}{warning_text})? Existing translations are never matched automatically."
+            f"{diff}",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.status_label.setText("Region candidate discarded; project content unchanged")
+            return
+        try:
+            committed = self.command_service.commit_region_candidate(
+                self.project,
+                result.document,
+                page_index=result.page_index,
+                command_id=result.command_id,
+                region=result.region,
+                selected_block_id=(
+                    result.candidate_block_ids[0] if result.candidate_block_ids else None
+                ),
+            )
+        except TranslationConflictError as exc:
+            if not self._confirm_translation_loss(str(exc)):
+                self.status_label.setText("Region candidate discarded; translations preserved")
+                return
+            committed = self.command_service.commit_region_candidate(
+                self.project,
+                result.document,
+                page_index=result.page_index,
+                command_id=result.command_id,
+                region=result.region,
+                selected_block_id=(
+                    result.candidate_block_ids[0] if result.candidate_block_ids else None
+                ),
+                confirm_translation_loss=True,
+            )
+        self._accept_command_result(committed)
+
+    @staticmethod
+    def _region_block_summary(block: object) -> str:
+        block_id = str(getattr(block, "id", "unknown"))
+        block_type = str(getattr(block, "type", type(block).__name__))
+        text = str(getattr(block, "effective_text", "")).replace("\n", " ").strip()
+        if len(text) > 80:
+            text = f"{text[:77]}..."
+        detail = f': "{text}"' if text else ""
+        return f"{block_type} {block_id}{detail}"
+
+    def _navigate_warning(self, page_index: int, block_id: object) -> None:
+        selected = str(block_id) if isinstance(block_id, str) else None
+        self._pending_block_selection = selected
+        for row in range(self.page_list.count()):
+            if int(self.page_list.item(row).data(Qt.ItemDataRole.UserRole)) == page_index:
+                if row == self.page_list.currentRow() and selected is not None:
+                    self._select_block_by_id(selected)
+                    self._pending_block_selection = None
+                else:
+                    self.page_list.setCurrentRow(row)
+                break
+
+    def _acknowledge_warning(self, warning_id: str) -> None:
+        document = acknowledge_warning(self.project.document, warning_id)
+        self.project = self.workflow.store.save(
+            self.project.model_copy(update={"document": document})
+        )
+        self._clear_structure_history()
+        self.warning_center.refresh(self.project.document)
+        self._refresh_page_list()
+        self.document_changed.emit()
+        self.status_label.setText("Warning acknowledged; export semantics are unchanged")
+
+    def _confirm_translation_loss(self, message: str) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Detach translations?",
+            f"{message}. Translation cache remains available and Undo restores the active "
+            "record during this session. Continue?",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _refresh_history_buttons(self) -> None:
+        self.structure_widget.set_history_state(
+            self.command_service.stack.can_undo,
+            self.command_service.stack.can_redo,
+        )
+
+    def _clear_structure_history(self) -> None:
+        self.command_service.clear()
+        self._refresh_history_buttons()
 
     def _commit_document(self, document: BookDocument, select_id: str) -> None:
         project = self.project.model_copy(update={"document": document})
         self.project = self.workflow.store.save(project)
+        self._clear_structure_history()
         self._refresh_blocks()
         self._select_block_by_id(select_id)
         self._refresh_preview()
@@ -753,6 +969,7 @@ class MainWindow(QMainWindow):
         if not isinstance(result, BatchTranslationResult):
             raise TypeError("Unexpected translation worker result")
         self.project = result.project
+        self._clear_structure_history()
         self.translation_view.clear_task_statuses()
         self.cancel_button.setEnabled(False)
         self.translation_view.set_busy(False)
@@ -810,12 +1027,14 @@ class MainWindow(QMainWindow):
             for page in self.project.document.pages
             if page.parse_status != "parsed" or page.parse_warnings
         ]
-        if (incomplete or incomplete_pages) and self.confirm_incomplete_export:
+        export_warnings = active_export_warnings(self.project.document)
+        if (incomplete or incomplete_pages or export_warnings) and self.confirm_incomplete_export:
             answer = QMessageBox.question(
                 self,
                 "Incomplete bilingual content",
                 f"{incomplete} paragraphs do not have a valid translation. "
                 f"{len(incomplete_pages)} pages are unparsed, stale, failed, or have warnings. "
+                f"{len(export_warnings)} active structured warnings affect export. "
                 "Export a valid but incomplete bilingual EPUB anyway?",
             )
             if answer != QMessageBox.StandardButton.Yes:
@@ -833,7 +1052,7 @@ class MainWindow(QMainWindow):
                 output,
                 options=EpubBuildOptions(
                     mode="source_translation",
-                    include_incomplete_notice=bool(incomplete_pages),
+                    include_incomplete_notice=bool(incomplete_pages or export_warnings),
                 ),
             )
             report = EpubValidator(self.epubcheck_jar).validate(output)

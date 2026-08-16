@@ -50,6 +50,10 @@ class ReparseConflictError(Pdf2EpubError):
     """A reparse would replace manual edits, derived blocks, or translations."""
 
 
+class TranslationConflictError(Pdf2EpubError):
+    """A structure command would detach one or more active translations."""
+
+
 class ProjectPersistenceError(Pdf2EpubError):
     """A project could not be saved or loaded."""
 

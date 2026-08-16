@@ -37,10 +37,15 @@ def merged_block_id(block_ids: Iterable[str]) -> str:
     return f"merge-{_stable_hash(ids)}"
 
 
-def split_block_id(parent_id: str, split_offset: int, side: str) -> str:
+def split_block_id(
+    parent_id: str,
+    split_offset: int,
+    side: str,
+    source_fingerprint: str | None = None,
+) -> str:
     if side not in {"left", "right"}:
         raise ValueError("side must be 'left' or 'right'")
-    return f"split-{_stable_hash((parent_id, str(split_offset), side))}"
+    return f"split-{_stable_hash((parent_id, source_fingerprint or '', str(split_offset), side))}"
 
 
 def stable_asset_id(content_sha256: str) -> str:

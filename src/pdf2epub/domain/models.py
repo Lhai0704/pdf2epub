@@ -71,6 +71,9 @@ class ProcessingProvenance(StrictModel):
     model_versions: dict[str, str] = Field(default_factory=dict)
     raw_payload_schema: str | None = None
     raw_element_ids: list[str] = Field(default_factory=list)
+    derived_from_block_ids: list[str] = Field(default_factory=list)
+    edit_operation_ids: list[str] = Field(default_factory=list)
+    source_region: BBox | None = None
 
 
 TranslationStatus = Literal[
@@ -194,11 +197,56 @@ class CaptionBlock(TextBlockBase):
     for_asset_id: str
 
 
+class PageHeaderBlock(TextBlockBase):
+    type: Literal["page_header"] = "page_header"
+
+
+class PageFooterBlock(TextBlockBase):
+    type: Literal["page_footer"] = "page_footer"
+
+
 Block = Annotated[
-    ParagraphBlock | HeadingBlock | ImageBlock | CaptionBlock,
+    ParagraphBlock | HeadingBlock | ImageBlock | CaptionBlock | PageHeaderBlock | PageFooterBlock,
     Field(discriminator="type"),
 ]
-TextBlock = ParagraphBlock | HeadingBlock | CaptionBlock
+TextBlock = ParagraphBlock | HeadingBlock | CaptionBlock | PageHeaderBlock | PageFooterBlock
+
+
+class EditAuditEvent(StrictModel):
+    event_id: str
+    command_id: str
+    action: Literal["execute", "undo", "redo"]
+    kind: Literal[
+        "edit_block",
+        "merge_blocks",
+        "split_block",
+        "region_replace",
+    ]
+    page_index: int = Field(ge=0)
+    region: BBox | None = None
+    before_block_ids: list[str] = Field(default_factory=list)
+    after_block_ids: list[str] = Field(default_factory=list)
+    translation_disposition: Literal["none", "preserved", "staled", "removed"] = "none"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ProjectWarning(StrictModel):
+    id: str
+    code: str
+    severity: Literal["info", "warning", "error"] = "warning"
+    source: Literal["parser", "structure", "translation", "export", "region"]
+    message: str
+    page_index: int | None = Field(default=None, ge=0)
+    block_id: str | None = None
+    affects_export: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    acknowledged_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def active(self) -> bool:
+        return self.resolved_at is None
 
 
 class NativeTextQuality(StrictModel):
@@ -292,12 +340,14 @@ class SourceDocument(StrictModel):
 
 
 class BookDocument(StrictModel):
-    schema_version: Literal["1.2"] = "1.2"
+    schema_version: Literal["1.3"] = "1.3"
     document_id: str
     metadata: BookMetadata
     source: SourceDocument
     pages: list[Page] = Field(default_factory=list)
     assets: dict[str, Asset] = Field(default_factory=dict)
+    edit_audit: list[EditAuditEvent] = Field(default_factory=list)
+    warnings: list[ProjectWarning] = Field(default_factory=list)
     translation_settings: TranslationSettings = Field(default_factory=TranslationSettings)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -319,6 +369,26 @@ class BookDocument(StrictModel):
                     raise ValueError(f"missing asset for image block {block.id}")
                 if isinstance(block, CaptionBlock) and block.for_asset_id not in self.assets:
                     raise ValueError(f"missing asset for caption block {block.id}")
+        event_ids = [event.event_id for event in self.edit_audit]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("edit audit event IDs must be unique")
+        warning_ids = [warning.id for warning in self.warnings]
+        if len(warning_ids) != len(set(warning_ids)):
+            raise ValueError("warning IDs must be unique")
+        known_pages = set(page_indexes)
+        known_blocks = set(block_ids)
+        for event in self.edit_audit:
+            if event.page_index not in known_pages:
+                raise ValueError(f"edit audit event references missing page {event.page_index}")
+        for warning in self.warnings:
+            if warning.page_index is not None and warning.page_index not in known_pages:
+                raise ValueError(f"warning references missing page {warning.page_index}")
+            if (
+                warning.active
+                and warning.block_id is not None
+                and warning.block_id not in known_blocks
+            ):
+                raise ValueError(f"active warning references missing block {warning.block_id}")
         return self
 
 

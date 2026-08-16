@@ -6,8 +6,9 @@ editable, versioned Document IR and exports a reflowable source-to-translation E
 M3 adds provider-neutral page classification/routing, per-page Native/OCR overrides,
 PaddleOCR/PP-StructureV3, checksummed OCR cache, confidence/bbox provenance, serial batch progress
 and cancellation, protected whole-page reparse, mixed EPUB, and explicit incomplete-content
-export. It still excludes multiple OCR engines, regional reparse, a complete EPUB reader, services,
-and installers.
+export. M4 adds auditable structure commands, session Undo/Redo, semantic running headers/footers,
+Paddle-only regional reparse with a separate cache, provenance inspection, and a persistent Warning
+Center. It still excludes multiple OCR engines, a complete EPUB reader, services, and installers.
 
 ## Development
 

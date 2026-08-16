@@ -11,7 +11,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from pdf2epub.domain.errors import EpubBuildError
-from pdf2epub.domain.models import BookDocument, HeadingBlock, ParagraphBlock
+from pdf2epub.domain.models import Asset, BookDocument, HeadingBlock, ImageBlock, ParagraphBlock
 from pdf2epub.epub.xhtml import (
     BOOK_CSS,
     Chapter,
@@ -66,7 +66,10 @@ def _nav_xhtml(title: str, language: str, chapters: list[tuple[str, str]]) -> st
 
 
 def _package_opf(
-    document: BookDocument, chapter_files: list[str], options: EpubBuildOptions
+    document: BookDocument,
+    chapter_files: list[str],
+    options: EpubBuildOptions,
+    assets: list[Asset],
 ) -> str:
     creator = (
         f"    <dc:creator>{html.escape(document.metadata.creator)}</dc:creator>\n"
@@ -82,7 +85,7 @@ def _package_opf(
         f'    <item id="{asset.id}" '
         f'href="images/{PurePosixPath(asset.relative_path).name}" '
         f'media-type="{html.escape(asset.mime_type, quote=True)}" />'
-        for asset in document.assets.values()
+        for asset in assets
     )
     spine = "\n".join(
         f'    <itemref idref="chapter-{index:03d}" />' for index in range(1, len(chapter_files) + 1)
@@ -127,6 +130,15 @@ class EpubBuilder:
         options: EpubBuildOptions | None = None,
     ) -> EpubBuildResult:
         options = options or EpubBuildOptions()
+        referenced_asset_ids = {
+            block.asset_id
+            for page in document.pages
+            for block in page.blocks
+            if isinstance(block, ImageBlock)
+        }
+        referenced_assets = [
+            asset for asset_id, asset in document.assets.items() if asset_id in referenced_asset_ids
+        ]
         chapters = build_chapters(document, mode=options.mode)
         notice = incomplete_notice_chapter(document)
         if notice is not None and not options.include_incomplete_notice:
@@ -153,7 +165,12 @@ class EpubBuilder:
                 archive.writestr("META-INF/container.xml", _container_xml())
                 archive.writestr(
                     "EPUB/package.opf",
-                    _package_opf(document, [chapter.file_name for chapter in chapters], options),
+                    _package_opf(
+                        document,
+                        [chapter.file_name for chapter in chapters],
+                        options,
+                        referenced_assets,
+                    ),
                 )
                 archive.writestr(
                     "EPUB/nav.xhtml",
@@ -169,7 +186,7 @@ class EpubBuilder:
                         f"EPUB/text/{chapter.file_name}",
                         chapter_xhtml(chapter, document.metadata.language),
                     )
-                for asset in document.assets.values():
+                for asset in referenced_assets:
                     source = project_root.joinpath(*PurePosixPath(asset.relative_path).parts)
                     if not source.is_file():
                         raise EpubBuildError(f"Missing project asset: {asset.id}")

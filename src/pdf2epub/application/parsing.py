@@ -37,7 +37,14 @@ def reparse_conflict(page: Page) -> ReparseConflict:
     return ReparseConflict(
         page_index=page.page_index,
         user_edited_blocks=sum(block.provenance.user_edited for block in page.blocks),
-        derived_blocks=sum(block.id.startswith(("merge-", "split-")) for block in page.blocks),
+        derived_blocks=sum(
+            bool(
+                block.id.startswith(("merge-", "split-"))
+                or block.provenance.derived_from_block_ids
+                or block.provenance.edit_operation_ids
+            )
+            for block in page.blocks
+        ),
         translations=sum(
             isinstance(block, ParagraphBlock) and block.translation is not None
             for block in page.blocks

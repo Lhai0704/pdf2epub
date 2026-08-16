@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pdf2epub.domain.models import Page
-from pdf2epub.persistence.parse_cache import OcrCacheKey, OcrCacheRecord, OcrParseCache
+from pdf2epub.domain.models import BBox, Page, ParagraphBlock, ProcessingProvenance
+from pdf2epub.persistence.parse_cache import (
+    OcrCacheKey,
+    OcrCacheRecord,
+    OcrParseCache,
+    RegionOcrCacheKey,
+    RegionOcrCacheRecord,
+    RegionOcrParseCache,
+)
 
 
 def cache_key() -> OcrCacheKey:
@@ -56,3 +63,38 @@ def test_corrupt_ocr_cache_becomes_miss_and_is_preserved(tmp_path: Path) -> None
     assert cache.load(key) is None
     assert not path.exists()
     assert list(path.parent.glob(f"{path.name}.corrupt-*"))
+
+
+def test_region_cache_is_separate_and_region_sensitive(tmp_path: Path) -> None:
+    base = cache_key().model_dump()
+    key = RegionOcrCacheKey(**base, region=(10.0, 20.0, 80.0, 100.0))
+    cache = RegionOcrParseCache(tmp_path)
+    record = RegionOcrCacheRecord(
+        key=key,
+        raw_data={"res": {}},
+        blocks=[
+            ParagraphBlock(
+                id="region-paragraph",
+                bbox=BBox(x0=10, y0=20, x1=80, y1=40),
+                reading_order=0,
+                provenance=ProcessingProvenance(
+                    source_sha256="a" * 64,
+                    parser_id="paddle_ppstructure_v3",
+                    parser_version="3.7.0",
+                    options_hash="c" * 64,
+                ),
+                source_text_raw="Chapter 1",
+                source_text_normalized="Chapter 1",
+            )
+        ],
+        assets=[],
+        warnings=[],
+    )
+    path = cache.store(record)
+    loaded = cache.load(key)
+    assert loaded is not None
+    assert loaded.blocks[0].id == "region-paragraph"
+    changed = key.model_copy(update={"region": (11.0, 20.0, 80.0, 100.0)})
+    assert changed.fingerprint != key.fingerprint
+    assert cache.load(changed) is None
+    assert "regions" in path.parts

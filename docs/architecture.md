@@ -1,15 +1,15 @@
-# M0-M3 architecture
+# M0-M4 architecture
 
 ```text
 PDF analyzer -> page classification -> parser router
                                       /             \
                               Native adapter   Paddle adapter
                                       \             /
-                                  Document IR 1.2
+                                  Document IR 1.3
                                         |
                               application services
                     /             |                |          \
-              PySide6 GUI   editing/reparse   translation   EPUB builder
+              PySide6 GUI   commands/reparse  translation   EPUB builder
                                                                |
                                                            EPUBCheck
 ```
@@ -20,7 +20,8 @@ PDF analyzer -> page classification -> parser router
 - `parsers` owns Native/Paddle response handling and emits only Document IR. Paddle is imported
   lazily when an OCR extra is installed and OCR is explicitly requested.
 - `application` owns routing, page/range override, serial batch progress/cancellation, atomic
-  candidate reparse, project workflows, and the auditable editor.
+  candidate reparse, project workflows, structure commands, the session undo stack, warning
+  lifecycle, and provider-neutral provenance queries.
 - `persistence` owns copied sources, version migration, atomic project JSON, translation cache, and
   checksummed OCR parse cache.
 - `gui` calls application services and never reads Paddle payloads. Opening a page only renders a
@@ -41,3 +42,13 @@ device fallback is silent.
 
 Sanitized raw Native/OCR data and provenance are diagnostics/cache. Reopening a project uses
 `document.json`; Document IR remains authoritative.
+
+M4 structure commands validate and save a complete candidate before moving the in-memory undo/redo
+cursor. Compact execute/undo/redo audit events persist, while inverse snapshots do not survive a
+restart. Translation or whole-page parse changes clear the session stack.
+
+Regional OCR is a Paddle-only adapter capability. It uses a separate region cache and returns a
+candidate in full-page coordinates. GUI confirmation applies only the scoped blocks; cancellation
+or failure does not mutate Document IR. Semantic page headers/footers remain inspectable but are
+excluded from translation and EPUB. Active export-affecting warnings continue to require an
+incomplete-content notice even after acknowledgement.

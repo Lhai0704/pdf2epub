@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from typing import Any
 
 from pdf2epub.domain.errors import ProjectPersistenceError
 
-CURRENT_DOCUMENT_SCHEMA = "1.2"
+CURRENT_DOCUMENT_SCHEMA = "1.3"
 
 
 def _classification_from_quality(page: dict[str, Any]) -> dict[str, Any]:
@@ -65,6 +67,49 @@ def _migrate_11_to_12(payload: dict[str, Any]) -> dict[str, Any]:
             provenance.setdefault("model_versions", {})
             provenance.setdefault("raw_payload_schema", None)
             provenance.setdefault("raw_element_ids", [])
+            provenance.setdefault("derived_from_block_ids", [])
+            provenance.setdefault("edit_operation_ids", [])
+            provenance.setdefault("source_region", None)
+    return migrated
+
+
+def _warning_id(page_index: int, code: str, ordinal: int) -> str:
+    payload = json.dumps(
+        ["parser", page_index, code, ordinal], ensure_ascii=False, separators=(",", ":")
+    )
+    return f"warn-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:20]}"
+
+
+def _migrate_12_to_13(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = copy.deepcopy(payload)
+    migrated["schema_version"] = "1.3"
+    created_at = migrated.get("updated_at") or migrated.get("created_at")
+    warnings: list[dict[str, Any]] = []
+    for page in migrated.get("pages", []):
+        page_index = int(page.get("page_index", 0))
+        for ordinal, code in enumerate(page.get("parse_warnings", [])):
+            warning = {
+                "id": _warning_id(page_index, str(code), ordinal),
+                "code": str(code).split(":", 1)[0],
+                "severity": "warning",
+                "source": "parser",
+                "message": str(code),
+                "page_index": page_index,
+                "block_id": None,
+                "affects_export": True,
+                "acknowledged_at": None,
+                "resolved_at": None,
+            }
+            if created_at is not None:
+                warning["created_at"] = created_at
+            warnings.append(warning)
+        for block in page.get("blocks", []):
+            provenance = block.get("provenance", {})
+            provenance.setdefault("derived_from_block_ids", [])
+            provenance.setdefault("edit_operation_ids", [])
+            provenance.setdefault("source_region", None)
+    migrated.setdefault("edit_audit", [])
+    migrated.setdefault("warnings", warnings)
     return migrated
 
 
@@ -73,7 +118,7 @@ def migrate_document_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], s
     version = payload.get("schema_version")
     if version == CURRENT_DOCUMENT_SCHEMA:
         return payload, None
-    if version not in {"1.0", "1.1"}:
+    if version not in {"1.0", "1.1", "1.2"}:
         raise ProjectPersistenceError(f"Unsupported document schema version: {version!r}")
 
     migrated = copy.deepcopy(payload)
@@ -95,4 +140,6 @@ def migrate_document_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], s
             for block in page.get("blocks", []):
                 if block.get("type") == "paragraph":
                     block.setdefault("translation", None)
-    return _migrate_11_to_12(migrated), str(version)
+    if migrated.get("schema_version") in {"1.0", "1.1"}:
+        migrated = _migrate_11_to_12(migrated)
+    return _migrate_12_to_13(migrated), str(version)

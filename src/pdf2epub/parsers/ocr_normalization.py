@@ -80,13 +80,17 @@ def _page_bbox(
     image_height: float,
     page_width: float,
     page_height: float,
+    source_region: BBox | None = None,
 ) -> BBox | None:
     if image_width <= 0 or image_height <= 0:
         return None
-    x0 = min(max(raw_bbox[0] * page_width / image_width, 0), page_width)
-    y0 = min(max(raw_bbox[1] * page_height / image_height, 0), page_height)
-    x1 = min(max(raw_bbox[2] * page_width / image_width, 0), page_width)
-    y1 = min(max(raw_bbox[3] * page_height / image_height, 0), page_height)
+    region = source_region or BBox(x0=0, y0=0, x1=page_width, y1=page_height)
+    region_width = region.x1 - region.x0
+    region_height = region.y1 - region.y0
+    x0 = min(max(region.x0 + raw_bbox[0] * region_width / image_width, 0), page_width)
+    y0 = min(max(region.y0 + raw_bbox[1] * region_height / image_height, 0), page_height)
+    x1 = min(max(region.x0 + raw_bbox[2] * region_width / image_width, 0), page_width)
+    y1 = min(max(region.y0 + raw_bbox[3] * region_height / image_height, 0), page_height)
     if x1 <= x0 or y1 <= y0:
         return None
     return BBox(x0=x0, y0=y0, x1=x1, y1=y1)
@@ -182,6 +186,8 @@ def normalize_ppstructure_payload(
     raw_cache_path: str,
     package_versions: dict[str, str],
     model_versions: dict[str, str],
+    source_region: BBox | None = None,
+    edit_operation_id: str | None = None,
 ) -> NormalizationResult:
     res = payload.get("res")
     if not isinstance(res, dict):
@@ -210,6 +216,7 @@ def normalize_ppstructure_payload(
             image_height=float(height),
             page_width=page_width,
             page_height=page_height,
+            source_region=source_region,
         )
         if bbox is None:
             warnings.append(f"invalid_bbox_skipped:{index}")
@@ -264,6 +271,8 @@ def normalize_ppstructure_payload(
             model_versions={**package_versions, **model_versions},
             raw_payload_schema="ppstructure-v3-result-json",
             raw_element_ids=[raw_element_id],
+            edit_operation_ids=[edit_operation_id] if edit_operation_id else [],
+            source_region=source_region,
         )
 
         if index in crop_indexes:

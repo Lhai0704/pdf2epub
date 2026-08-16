@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 
+from pdf2epub.application.commands import StructureCommandService
+from pdf2epub.application.region_reparse import RegionReparseService
 from pdf2epub.application.workflow import BookWorkflow
 from pdf2epub.fixtures import make_scanned_only
 from pdf2epub.parsers.base import OcrParseOptions
@@ -67,6 +69,7 @@ def main() -> int:
     parser.add_argument("--require-existing-models", action="store_true")
     parser.add_argument("--require-cache-hit", action="store_true")
     parser.add_argument("--benchmark-cpu", action="store_true")
+    parser.add_argument("--region-reparse", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     arguments = parser.parse_args()
     if arguments.confirm_model_download and arguments.no_model_download:
@@ -123,6 +126,41 @@ def main() -> int:
         raise RuntimeError("Real OCR smoke returned no normalized Document IR blocks")
     if arguments.require_cache_hit and not second_cache_hit:
         raise RuntimeError("The repeated OCR parse did not hit the project OCR cache")
+    region_summary: dict[str, object] | None = None
+    if arguments.region_reparse:
+        source_block = page.blocks[0]
+        region_service = RegionReparseService(workflow.registry, store=workflow.store)
+        first_region = region_service.build_candidate(
+            project,
+            0,
+            source_block.bbox,
+            options=options,
+        )
+        repeat_region = region_service.build_candidate(
+            project,
+            0,
+            source_block.bbox,
+            options=options,
+        )
+        if arguments.require_cache_hit and not repeat_region.cache_hit:
+            raise RuntimeError("The repeated region OCR did not hit the region cache")
+        committed = StructureCommandService(store=workflow.store).commit_region_candidate(
+            project,
+            repeat_region.document,
+            page_index=0,
+            command_id=repeat_region.command_id,
+            region=repeat_region.region,
+            selected_block_id=repeat_region.candidate_block_ids[0],
+            confirm_translation_loss=True,
+        )
+        project = committed.project
+        region_summary = {
+            "first_cache_hit": first_region.cache_hit,
+            "second_cache_hit": repeat_region.cache_hit,
+            "replaced_blocks": len(repeat_region.replaced_block_ids),
+            "candidate_blocks": len(repeat_region.candidate_block_ids),
+            "audit_kind": project.document.edit_audit[-1].kind,
+        }
     missing_after, model_bytes_after = _models_ready(model_root)
     if missing_after:
         raise RuntimeError(f"OCR initialization left models missing: {', '.join(missing_after)}")
@@ -147,6 +185,7 @@ def main() -> int:
                 "second_cache_hit": second_cache_hit,
                 "block_count": len(page.blocks),
                 "warning_count": len(page.parse_warnings),
+                "region_reparse": region_summary,
                 "cpu_benchmark": cpu_note,
             },
             ensure_ascii=False,

@@ -1243,6 +1243,12 @@ ProjectPersistenceError
 - provenance inspector；
 - warning center。
 
+M4 implementation note (2026-08-16): Document IR 1.3 uses semantic page-header/footer blocks,
+compact persistent audit events, structured warning lifecycle, and a 100-entry session-only
+Undo/Redo stack. Regional reparse is deliberately limited to parsed Paddle pages and uses a
+separate checksummed region cache; Native regional parsing and empty-area insertion remain future
+work. Warning acknowledgement records review but does not relax incomplete-export safeguards.
+
 ## M5：多解析器与高级能力
 
 再评估：

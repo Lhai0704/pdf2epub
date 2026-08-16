@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from pdf2epub.application.warnings import active_export_warnings
 from pdf2epub.domain.models import (
     BookDocument,
     CaptionBlock,
@@ -121,13 +122,25 @@ def incomplete_notice_chapter(document: BookDocument) -> Chapter | None:
         for page in sorted(document.pages, key=lambda value: value.page_index)
         if page.parse_status != "parsed" or page.parse_warnings
     ]
-    if not incomplete:
+    structured = active_export_warnings(document)
+    if not incomplete and not structured:
         return None
     items = []
     for page in incomplete:
         details = [page.parse_status, *page.parse_warnings]
         escaped = html.escape(", ".join(details), quote=False)
         items.append(f"<li>Page {page.page_index + 1}: {escaped}</li>")
+    existing = {
+        (page.page_index, warning) for page in incomplete for warning in page.parse_warnings
+    }
+    for warning in structured:
+        if (warning.page_index, warning.message) in existing:
+            continue
+        location = (
+            f"Page {warning.page_index + 1}: " if warning.page_index is not None else "Document: "
+        )
+        warning_details = html.escape(f"{warning.code} ({warning.severity})", quote=False)
+        items.append(f"<li>{location}{warning_details}</li>")
     body = (
         '<section class="incomplete-notice"><h1>Incomplete content notice</h1>'
         "<p>Some source pages were not completely parsed.</p><ul>"

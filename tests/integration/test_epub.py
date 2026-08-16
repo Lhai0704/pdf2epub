@@ -4,8 +4,12 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+import pytest
+
 from pdf2epub.application.workflow import BookWorkflow
-from pdf2epub.epub.builder import EpubBuilder
+from pdf2epub.domain.errors import EpubBuildError
+from pdf2epub.domain.models import ProjectWarning
+from pdf2epub.epub.builder import EpubBuilder, EpubBuildOptions
 from pdf2epub.epub.validator import EpubValidator
 
 
@@ -35,3 +39,33 @@ def test_epub_structure_and_epubcheck(fixture_corpus: Path, tmp_path: Path) -> N
     report = EpubValidator(jar).validate(output)
     assert report.passed, report.output
     assert report.errors == 0
+
+
+def test_structured_warning_requires_incomplete_notice(
+    fixture_corpus: Path, tmp_path: Path
+) -> None:
+    workflow = BookWorkflow()
+    project = workflow.create_project(
+        tmp_path / "warning-epub.bepub-project",
+        fixture_corpus / "digital_single_column.pdf",
+    )
+    project, _ = workflow.parse_all(project)
+    warning = ProjectWarning(
+        id="warn-export",
+        code="structure_review_required",
+        source="structure",
+        message="Structure review is required",
+        page_index=0,
+        affects_export=True,
+    )
+    document = project.document.model_copy(update={"warnings": [warning]})
+    output = tmp_path / "warning.epub"
+    with pytest.raises(EpubBuildError, match="explicit incomplete export confirmation"):
+        EpubBuilder().build(document, Path(project.root), output)
+    EpubBuilder().build(
+        document,
+        Path(project.root),
+        output,
+        options=EpubBuildOptions(include_incomplete_notice=True),
+    )
+    assert output.is_file()

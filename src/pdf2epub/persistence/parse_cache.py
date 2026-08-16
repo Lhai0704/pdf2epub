@@ -13,9 +13,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from pdf2epub.domain.errors import OcrCacheError
-from pdf2epub.domain.models import Asset, Page
+from pdf2epub.domain.models import Asset, Block, Page
 
 OCR_CACHE_SCHEMA = "paddle-parse-cache-v1"
+REGION_OCR_CACHE_SCHEMA = "paddle-region-cache-v1"
 MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 
 
@@ -63,7 +64,27 @@ class OcrCacheRecord(BaseModel):
         return self.model_copy(update={"checksum": _record_checksum(self)})
 
 
-def _record_checksum(record: OcrCacheRecord) -> str:
+class RegionOcrCacheKey(OcrCacheKey):
+    region: tuple[float, float, float, float]
+    region_render_version: str = "pymupdf-region-v1"
+
+
+class RegionOcrCacheRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_version: str = REGION_OCR_CACHE_SCHEMA
+    key: RegionOcrCacheKey
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    raw_data: dict[str, Any]
+    blocks: list[Block]
+    assets: list[Asset]
+    warnings: list[str]
+    checksum: str = ""
+
+    def with_checksum(self) -> RegionOcrCacheRecord:
+        return self.model_copy(update={"checksum": _record_checksum(self)})
+
+
+def _record_checksum(record: BaseModel) -> str:
     payload = record.model_dump(mode="json", exclude={"checksum"})
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
@@ -128,3 +149,61 @@ class OcrParseCache:
         destination = path.with_name(f"{path.name}.corrupt-{timestamp}")
         with suppress(OSError):
             os.replace(path, destination)
+
+
+class RegionOcrParseCache:
+    def __init__(self, project_root: Path) -> None:
+        self.directory = project_root / "cache" / "parse" / "paddle_ppstructure_v3" / "regions"
+
+    def path_for(self, key: RegionOcrCacheKey) -> Path:
+        return self.directory / f"{key.fingerprint}.json.gz"
+
+    def load(self, key: RegionOcrCacheKey) -> RegionOcrCacheRecord | None:
+        path = self.path_for(key)
+        if not path.is_file():
+            return None
+        try:
+            with gzip.open(path, "rb") as handle:
+                raw = handle.read(MAX_UNCOMPRESSED_BYTES + 1)
+            if len(raw) > MAX_UNCOMPRESSED_BYTES:
+                raise ValueError("uncompressed region cache exceeds 64 MiB")
+            record = RegionOcrCacheRecord.model_validate_json(raw)
+            if record.schema_version != REGION_OCR_CACHE_SCHEMA:
+                raise ValueError("unsupported region OCR cache schema")
+            if record.key != key:
+                raise ValueError("region OCR cache key mismatch")
+            if record.checksum != _record_checksum(record):
+                raise ValueError("region OCR cache checksum mismatch")
+            return record
+        except (OSError, ValueError, ValidationError, json.JSONDecodeError):
+            OcrParseCache._preserve_corrupt(path)
+            return None
+
+    def store(self, record: RegionOcrCacheRecord) -> Path:
+        checked = record.with_checksum()
+        # Block ``effective_text`` values are computed views, not persisted IR fields.
+        # Serializing them makes the strict Block union reject its own cache record
+        # during replay.
+        raw = checked.model_dump_json(
+            exclude_none=False,
+            exclude_computed_fields=True,
+        ).encode("utf-8")
+        if len(raw) > MAX_UNCOMPRESSED_BYTES:
+            raise OcrCacheError("Region OCR cache record exceeds the 64 MiB safety limit")
+        path = self.path_for(checked.key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                with gzip.GzipFile(fileobj=handle, mode="wb", mtime=0) as compressed:
+                    compressed.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except OSError as exc:
+            raise OcrCacheError(f"Could not write region OCR cache: {type(exc).__name__}") from exc
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return path

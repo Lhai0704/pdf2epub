@@ -1,7 +1,8 @@
-# Document IR v1.2
+# Document IR v1.3
 
 `BookDocument` is the source of truth. It stores source/book metadata, ordered pages, assets,
-translation settings, and a discriminated union of paragraph, heading, image, and caption blocks.
+translation settings, compact edit audit events, structured warnings, and a discriminated union of
+paragraph, heading, image, caption, page-header, and page-footer blocks.
 
 ## Pages and routing
 
@@ -27,7 +28,12 @@ IDs. Edit/type changes preserve IDs; merge/split derive auditable IDs.
 
 Provenance records source/parser/options, provider/engine/device/precision, package and model
 versions/hashes, raw payload schema/element IDs, raw cache location, warnings, and manual-edit
-state. Raw parser response formats never escape the adapter.
+state. M4 also records derivation parent IDs, edit operation IDs and an optional source region. Raw
+parser response formats never escape the adapter.
+
+Page headers and footers are semantic text blocks rather than deleted content. Their IDs, text
+layers, bbox and provenance persist and remain visible in the workbench, but they are not paragraph
+translation units and are not serialized into EPUB.
 
 ## Translation and reparse
 
@@ -40,9 +46,26 @@ Any user edit, merge/split block, or translation is a reparse conflict. Confirma
 whole-page replacement, removes translations attached to replaced blocks, and does not infer block
 matches. Old raw/cache data remains available. M3 has no undo or regional reparse.
 
+M4 structure changes are command-addressable. Text/type/heading changes retain IDs; merge derives
+an ID from ordered inputs; split also includes the source fingerprint and offset. Execute, undo and
+redo append `EditAuditEvent` records without duplicating book text. The finite inverse stack is
+session-only. A structure operation that removes paragraph addressability requires confirmation and
+does not infer translation inheritance; session undo restores the exact prior TranslationRecord.
+
+Paddle regional reparse returns a candidate whose bbox values are mapped into full-page space. The
+page-level parser ID and whole-page fingerprint remain unchanged; new blocks carry region and edit
+operation provenance. Whole-page reparse treats those edits as conflicts.
+
+## Warnings
+
+`ProjectWarning` gives each warning a stable ID, code, severity, source, page/block reference,
+export impact, acknowledgement and resolution timestamps. Acknowledgement never resolves a warning
+or relaxes export. Old page/parser warning strings remain extraction evidence and are indexed into
+structured warnings for the Warning Center.
+
 ## Migration
 
-The loader migrates 1.0 -> 1.1 -> 1.2 and 1.1 -> 1.2 in memory. Existing IDs, text layers, edits,
-translations, assets, and parsed content are preserved. A conservative classification with 0.60
-confidence is derived from legacy native quality. The next normal save atomically writes 1.2.
-Unknown future versions and invalid references are rejected.
+The loader migrates 1.0 -> 1.1 -> 1.2 -> 1.3, 1.1 -> 1.2 -> 1.3, and 1.2 -> 1.3 in memory.
+Existing IDs, text layers, edits, translations, assets, routing and parsed content are preserved.
+A conservative classification with 0.60 confidence is derived from legacy native quality. The next
+normal save atomically writes 1.3. Unknown future versions and invalid references are rejected.

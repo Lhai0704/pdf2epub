@@ -6,7 +6,7 @@ import pytest
 from pytestqt.qtbot import QtBot
 
 from pdf2epub.application.workflow import BookWorkflow
-from pdf2epub.domain.models import HeadingBlock, ParagraphBlock
+from pdf2epub.domain.models import HeadingBlock, PageHeaderBlock, ParagraphBlock
 from pdf2epub.gui.main_window import MainWindow
 from pdf2epub.translation.fake import FakeTranslator
 
@@ -154,3 +154,41 @@ def test_gui_batch_translation_and_manual_edit(
     with qtbot.waitSignal(window.document_changed, timeout=2000):
         window.translation_view._apply_translation()
     assert "manual GUI translation" in window.preview.toPlainText()
+
+
+@pytest.mark.gui
+def test_gui_structure_header_undo_and_provenance(
+    qtbot: QtBot, fixture_corpus: Path, tmp_path: Path
+) -> None:
+    workflow = BookWorkflow()
+    project = workflow.create_project(
+        tmp_path / "m4-gui.bepub-project",
+        fixture_corpus / "digital_single_column.pdf",
+    )
+    project, _ = workflow.parse_page(project, 0)
+    workflow.render_page(project, 0)
+    window = MainWindow(project, workflow=workflow)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitUntil(lambda: not window._page_loading, timeout=5000)
+    paragraph_row = next(
+        row
+        for row, block in enumerate(window._current_page().blocks)
+        if isinstance(block, ParagraphBlock)
+    )
+    window.block_list.setCurrentRow(paragraph_row)
+    block_id = window.current_block_id
+    assert block_id is not None
+    window.type_combo.setCurrentText("page_header")
+    with qtbot.waitSignal(window.document_changed, timeout=2000):
+        window.apply_edit()
+    header = next(block for block in window._current_page().blocks if block.id == block_id)
+    assert isinstance(header, PageHeaderBlock)
+    assert window.structure_widget.undo_button.isEnabled()
+    assert block_id in window.provenance_inspector.toPlainText()
+
+    with qtbot.waitSignal(window.document_changed, timeout=2000):
+        window.undo_structure()
+    restored = next(block for block in window._current_page().blocks if block.id == block_id)
+    assert isinstance(restored, ParagraphBlock)
+    assert window.structure_widget.redo_button.isEnabled()

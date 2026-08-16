@@ -15,7 +15,15 @@ from pdf2epub.domain.errors import (
     OcrPayloadError,
     OcrRuntimeUnavailableError,
 )
-from pdf2epub.parsers.base import OcrParseOptions, PageContext, PageParseResult, ParseOptions
+from pdf2epub.domain.models import BBox, Block
+from pdf2epub.parsers.base import (
+    OcrParseOptions,
+    PageContext,
+    PageParseResult,
+    ParseOptions,
+    RegionParseRequest,
+    RegionParseResult,
+)
 from pdf2epub.parsers.ocr_normalization import (
     NORMALIZATION_SCHEMA,
     normalize_ppstructure_payload,
@@ -23,7 +31,14 @@ from pdf2epub.parsers.ocr_normalization import (
 from pdf2epub.pdf.analyzer import native_text_quality
 from pdf2epub.pdf.classifier import classify_page
 from pdf2epub.pdf.renderer import RENDERER_VERSION, PdfRenderer
-from pdf2epub.persistence.parse_cache import OcrCacheKey, OcrCacheRecord, OcrParseCache
+from pdf2epub.persistence.parse_cache import (
+    OcrCacheKey,
+    OcrCacheRecord,
+    OcrParseCache,
+    RegionOcrCacheKey,
+    RegionOcrCacheRecord,
+    RegionOcrParseCache,
+)
 
 PARSER_ID = "paddle_ppstructure_v3"
 PARSER_VERSION = "3.7.0"
@@ -118,7 +133,13 @@ def _sanitize(value: Any) -> Any:
 class PaddleStructureParser:
     parser_id = PARSER_ID
     parser_version = PARSER_VERSION
-    capabilities: tuple[str, ...] = ("pdf", "ocr", "layout", "rendered_crops")
+    capabilities: tuple[str, ...] = (
+        "pdf",
+        "ocr",
+        "layout",
+        "rendered_crops",
+        "region_ocr",
+    )
     cancellation_boundary: Literal["page"] = "page"
 
     def __init__(self, *, renderer: PdfRenderer | None = None) -> None:
@@ -260,6 +281,131 @@ class PaddleStructureParser:
         return PageParseResult(
             page=normalized.page,
             assets=normalized.assets,
+            parse_fingerprint=key.fingerprint,
+        )
+
+    def parse_region(
+        self,
+        context: PageContext,
+        request: RegionParseRequest,
+        options: ParseOptions,
+    ) -> RegionParseResult:
+        ocr_options = self._ocr_options(options)
+        models = self._model_names(context.language)
+        cache_root = default_model_cache_root()
+        os.environ["PADDLE_PDX_CACHE_HOME"] = str(cache_root)
+        missing = [
+            model
+            for model in models.values()
+            if not (cache_root / "official_models" / model).is_dir()
+        ]
+        if missing and not ocr_options.allow_model_download:
+            raise OcrModelUnavailableError(
+                "OCR models are not installed; approve the first model download before parsing",
+                code="ocr_model_download_required",
+                fatal=True,
+            )
+        if not missing:
+            os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+
+        package_versions = self._package_versions(require_runtime=True)
+        pipeline = self._get_pipeline(ocr_options, context.language, models)
+        model_hashes = self._available_model_hashes(models, require_all=True)
+        page_width, page_height, rotation, quality = self._page_geometry(context)
+        region = self._validated_region(request.region, page_width, page_height)
+        classification = classify_page(quality, rotation)
+        key = self._region_cache_key(
+            context,
+            ocr_options,
+            region=region,
+            rotation=rotation,
+            package_versions=package_versions,
+            model_names=models,
+            model_hashes=model_hashes,
+        )
+        cache = RegionOcrParseCache(context.project_root)
+        if not ocr_options.bypass_cache and (record := cache.load(key)) is not None:
+            blocks = self._bind_region_operation(record.blocks, request.command_id, region)
+            return RegionParseResult(
+                blocks=blocks,
+                assets=tuple(record.assets),
+                warnings=tuple(record.warnings),
+                parse_fingerprint=key.fingerprint,
+                cache_hit=True,
+            )
+
+        image_path = self.renderer.render_region(
+            context.source_path,
+            context.source_sha256,
+            context.page_index,
+            region,
+            context.project_root / "cache" / "parse" / "ocr_region_renders",
+            dpi=ocr_options.dpi,
+            max_pixels=ocr_options.max_page_pixels,
+        )
+        try:
+            results = list(pipeline.predict(str(image_path)))
+        except Exception as exc:
+            message = str(exc).casefold()
+            if "out of memory" in message or "resourceexhausted" in message:
+                raise OcrError(
+                    "GPU memory was exhausted while parsing this region",
+                    code="ocr_gpu_oom",
+                    fatal=True,
+                ) from exc
+            raise OcrError(
+                "PP-StructureV3 region inference failed on "
+                f"page {context.page_index + 1}: {type(exc).__name__}",
+                code="ocr_region_inference_failed",
+            ) from exc
+        if len(results) != 1:
+            raise OcrPayloadError(
+                "PP-StructureV3 returned an unexpected region count", code="ocr_schema"
+            )
+        raw = getattr(results[0], "json", None)
+        if not isinstance(raw, dict) or not isinstance((payload := _sanitize(raw)), dict):
+            raise OcrPayloadError("PP-StructureV3 returned no region JSON", code="ocr_schema")
+        options_hash = hashlib.sha256(
+            ocr_options.model_dump_json(exclude={"allow_model_download", "bypass_cache"}).encode()
+        ).hexdigest()
+        relative_cache = (
+            Path("cache") / "parse" / PARSER_ID / "regions" / f"{key.fingerprint}.json.gz"
+        ).as_posix()
+        provenance_models = {
+            **{f"{role}_model": name for role, name in models.items()},
+            **{f"{role}_sha256": digest for role, digest in model_hashes.items()},
+        }
+        normalized = normalize_ppstructure_payload(
+            payload,
+            context=context,
+            options=ocr_options,
+            page_width=page_width,
+            page_height=page_height,
+            rotation=rotation,
+            quality=quality,
+            classification=classification,
+            parser_version=self.parser_version,
+            options_hash=options_hash,
+            parse_fingerprint=key.fingerprint,
+            raw_cache_path=relative_cache,
+            package_versions=package_versions,
+            model_versions=provenance_models,
+            source_region=region,
+        )
+        cache.store(
+            RegionOcrCacheRecord(
+                key=key,
+                raw_data=payload,
+                blocks=list(normalized.page.blocks),
+                assets=list(normalized.assets),
+                warnings=list(normalized.warnings),
+            )
+        )
+        blocks = self._bind_region_operation(normalized.page.blocks, request.command_id, region)
+        return RegionParseResult(
+            blocks=blocks,
+            assets=normalized.assets,
+            warnings=normalized.warnings,
             parse_fingerprint=key.fingerprint,
         )
 
@@ -422,3 +568,66 @@ class PaddleStructureParser:
             options=option_payload,
             normalization_schema=NORMALIZATION_SCHEMA,
         )
+
+    def _region_cache_key(
+        self,
+        context: PageContext,
+        options: OcrParseOptions,
+        *,
+        region: BBox,
+        rotation: int,
+        package_versions: dict[str, str],
+        model_names: dict[str, str],
+        model_hashes: dict[str, str],
+    ) -> RegionOcrCacheKey:
+        base = self._cache_key(
+            context,
+            options,
+            rotation=rotation,
+            package_versions=package_versions,
+            model_names=model_names,
+            model_hashes=model_hashes,
+        )
+        payload = base.model_dump()
+        payload["normalization_schema"] = f"{NORMALIZATION_SCHEMA}-region-v1"
+        values = region.as_tuple()
+        quantized = (
+            round(values[0], 2),
+            round(values[1], 2),
+            round(values[2], 2),
+            round(values[3], 2),
+        )
+        return RegionOcrCacheKey(
+            **payload,
+            region=quantized,
+        )
+
+    @staticmethod
+    def _validated_region(region: BBox, page_width: float, page_height: float) -> BBox:
+        candidate = BBox(
+            x0=max(0, region.x0),
+            y0=max(0, region.y0),
+            x1=min(page_width, region.x1),
+            y1=min(page_height, region.y1),
+        )
+        if candidate.x1 <= candidate.x0 or candidate.y1 <= candidate.y0:
+            raise OcrError("Selected OCR region is empty", code="ocr_region_empty")
+        return candidate
+
+    @staticmethod
+    def _bind_region_operation(
+        blocks: list[Block] | tuple[Block, ...], command_id: str, region: BBox
+    ) -> tuple[Block, ...]:
+        bound: list[Block] = []
+        for block in blocks:
+            operation_ids = list(block.provenance.edit_operation_ids)
+            if command_id not in operation_ids:
+                operation_ids.append(command_id)
+            provenance = block.provenance.model_copy(
+                update={
+                    "edit_operation_ids": operation_ids,
+                    "source_region": region,
+                }
+            )
+            bound.append(block.model_copy(update={"provenance": provenance}))
+        return tuple(bound)

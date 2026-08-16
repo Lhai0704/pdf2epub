@@ -6,7 +6,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from pdf2epub.domain.models import Asset, Page
+from pdf2epub.domain.models import Asset, BBox, Block, Page
 
 
 class ParseOptions(BaseModel):
@@ -48,6 +48,21 @@ class PageParseResult:
     cache_hit: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class RegionParseRequest:
+    region: BBox
+    command_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RegionParseResult:
+    blocks: tuple[Block, ...]
+    assets: tuple[Asset, ...]
+    warnings: tuple[str, ...]
+    parse_fingerprint: str
+    cache_hit: bool = False
+
+
 class DocumentParser(Protocol):
     parser_id: str
     parser_version: str
@@ -59,3 +74,12 @@ class DocumentParser(Protocol):
     def fingerprint(self, context: PageContext, options: ParseOptions) -> tuple[str, str]: ...
 
     def parse_page(self, context: PageContext, options: ParseOptions) -> PageParseResult: ...
+
+
+class RegionDocumentParser(DocumentParser, Protocol):
+    def parse_region(
+        self,
+        context: PageContext,
+        request: RegionParseRequest,
+        options: ParseOptions,
+    ) -> RegionParseResult: ...

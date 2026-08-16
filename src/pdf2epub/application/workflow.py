@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from pdf2epub.application.parsing import BatchParseSummary, ParseProgress, reparse_conflict
+from pdf2epub.application.warnings import synchronize_page_parser_warnings
 from pdf2epub.domain.errors import (
     OcrError,
     ParserUnavailableError,
@@ -193,6 +194,7 @@ class BookWorkflow:
         assets = project.document.assets.copy()
         assets.update({asset.id: asset for asset in result.assets})
         document = project.document.model_copy(update={"pages": pages, "assets": assets})
+        document = synchronize_page_parser_warnings(document, page_index)
         saved = self.store.save(project.model_copy(update={"document": document}))
         return saved, result.cache_hit
 

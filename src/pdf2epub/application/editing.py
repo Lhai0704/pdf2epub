@@ -9,6 +9,8 @@ from pdf2epub.domain.models import (
     CaptionBlock,
     HeadingBlock,
     Page,
+    PageFooterBlock,
+    PageHeaderBlock,
     ParagraphBlock,
     ProcessingProvenance,
     TextBlock,
@@ -55,6 +57,10 @@ def _make_text_block(
     if heading:
         level = template.level if isinstance(template, HeadingBlock) else 1
         return HeadingBlock(**common, level=level)  # type: ignore[arg-type]
+    if isinstance(template, PageHeaderBlock):
+        return PageHeaderBlock(**common)  # type: ignore[arg-type]
+    if isinstance(template, PageFooterBlock):
+        return PageFooterBlock(**common)  # type: ignore[arg-type]
     if isinstance(template, CaptionBlock):
         return CaptionBlock(**common, for_asset_id=template.for_asset_id)  # type: ignore[arg-type]
     return ParagraphBlock(**common)  # type: ignore[arg-type]
@@ -64,17 +70,29 @@ class DocumentEditor:
     """Auditable source/translation editor returning newly validated documents."""
 
     def edit_text(
-        self, document: BookDocument, page_index: int, block_id: str, text: str
+        self,
+        document: BookDocument,
+        page_index: int,
+        block_id: str,
+        text: str,
+        *,
+        operation_id: str | None = None,
     ) -> BookDocument:
         page = self._page(document, page_index)
         blocks = []
         found = False
         for block in page.blocks:
             if block.id == block_id and isinstance(
-                block, (ParagraphBlock, HeadingBlock, CaptionBlock)
+                block,
+                (ParagraphBlock, HeadingBlock, CaptionBlock, PageHeaderBlock, PageFooterBlock),
             ):
                 previous_fingerprint = source_fingerprint(block.effective_text)
-                provenance = block.provenance.model_copy(update={"user_edited": True})
+                operation_ids = list(block.provenance.edit_operation_ids)
+                if operation_id is not None and operation_id not in operation_ids:
+                    operation_ids.append(operation_id)
+                provenance = block.provenance.model_copy(
+                    update={"user_edited": True, "edit_operation_ids": operation_ids}
+                )
                 block = block.model_copy(
                     update={"source_text_user": text, "provenance": provenance}
                 )
@@ -103,45 +121,51 @@ class DocumentEditor:
         block_id: str,
         block_type: str,
         heading_level: int = 1,
+        *,
+        operation_id: str | None = None,
     ) -> BookDocument:
         page = self._page(document, page_index)
         blocks = []
         found = False
         for block in page.blocks:
             if block.id == block_id and isinstance(
-                block, (ParagraphBlock, HeadingBlock, CaptionBlock)
+                block, (ParagraphBlock, HeadingBlock, PageHeaderBlock, PageFooterBlock)
             ):
-                provenance = block.provenance.model_copy(update={"user_edited": True})
+                operation_ids = list(block.provenance.edit_operation_ids)
+                if operation_id is not None and operation_id not in operation_ids:
+                    operation_ids.append(operation_id)
+                provenance = block.provenance.model_copy(
+                    update={"user_edited": True, "edit_operation_ids": operation_ids}
+                )
+                common = {
+                    "id": block.id,
+                    "bbox": block.bbox,
+                    "reading_order": block.reading_order,
+                    "provenance": provenance,
+                    "source_text_raw": block.source_text_raw,
+                    "source_text_normalized": block.source_text_normalized,
+                    "source_text_user": block.source_text_user,
+                    "style": block.style,
+                    "confidence": block.confidence,
+                }
                 if block_type == "heading":
-                    block = HeadingBlock(
-                        id=block.id,
-                        bbox=block.bbox,
-                        reading_order=block.reading_order,
-                        provenance=provenance,
-                        source_text_raw=block.source_text_raw,
-                        source_text_normalized=block.source_text_normalized,
-                        source_text_user=block.source_text_user,
-                        style=block.style,
-                        confidence=block.confidence,
-                        level=heading_level,
-                    )
+                    block = HeadingBlock(**common, level=heading_level)  # type: ignore[arg-type]
                 elif block_type == "paragraph":
                     block = ParagraphBlock(
-                        id=block.id,
-                        bbox=block.bbox,
-                        reading_order=block.reading_order,
-                        provenance=provenance,
-                        source_text_raw=block.source_text_raw,
-                        source_text_normalized=block.source_text_normalized,
-                        source_text_user=block.source_text_user,
-                        style=block.style,
-                        confidence=block.confidence,
+                        **common,  # type: ignore[arg-type]
                         translation=block.translation
                         if isinstance(block, ParagraphBlock)
                         else None,
                     )
+                elif block_type == "page_header":
+                    block = PageHeaderBlock(**common)  # type: ignore[arg-type]
+                elif block_type == "page_footer":
+                    block = PageFooterBlock(**common)  # type: ignore[arg-type]
                 else:
-                    raise ValueError("M1 supports only paragraph and heading types")
+                    raise ValueError(
+                        "Structure editing supports paragraph, heading, page_header, "
+                        "and page_footer"
+                    )
                 found = True
             blocks.append(block)
         if not found:
@@ -245,7 +269,12 @@ class DocumentEditor:
         )
 
     def merge_adjacent(
-        self, document: BookDocument, page_index: int, first_block_id: str
+        self,
+        document: BookDocument,
+        page_index: int,
+        first_block_id: str,
+        *,
+        operation_id: str | None = None,
     ) -> BookDocument:
         page = self._page(document, page_index)
         index = next((i for i, block in enumerate(page.blocks) if block.id == first_block_id), -1)
@@ -253,10 +282,18 @@ class DocumentEditor:
             raise ValueError("A following block is required for merge")
         left = page.blocks[index]
         right = page.blocks[index + 1]
-        if not isinstance(left, (ParagraphBlock, HeadingBlock)) or not isinstance(
-            right, (ParagraphBlock, HeadingBlock)
+        mergeable = (ParagraphBlock, HeadingBlock, PageHeaderBlock, PageFooterBlock)
+        if not isinstance(left, mergeable) or not isinstance(right, mergeable):
+            raise ValueError("Only adjacent structure text blocks can be merged")
+        if type(left) is not type(right):
+            raise ValueError("Merged blocks must have the same structure type")
+        if isinstance(left, HeadingBlock) and (
+            not isinstance(right, HeadingBlock) or left.level != right.level
         ):
-            raise ValueError("Only adjacent text blocks can be merged")
+            raise ValueError("Merged headings must have the same level")
+        operation_ids = left.provenance.edit_operation_ids + right.provenance.edit_operation_ids
+        if operation_id is not None and operation_id not in operation_ids:
+            operation_ids.append(operation_id)
         provenance = left.provenance.model_copy(
             update={
                 "source_span_ids": (
@@ -264,6 +301,8 @@ class DocumentEditor:
                 ),
                 "warnings": left.provenance.warnings + right.provenance.warnings,
                 "user_edited": True,
+                "derived_from_block_ids": [left.id, right.id],
+                "edit_operation_ids": operation_ids,
             }
         )
         merged = _make_text_block(
@@ -285,14 +324,20 @@ class DocumentEditor:
         return self._replace_page(document, page.model_copy(update={"blocks": blocks}))
 
     def split_block(
-        self, document: BookDocument, page_index: int, block_id: str, offset: int
+        self,
+        document: BookDocument,
+        page_index: int,
+        block_id: str,
+        offset: int,
+        *,
+        operation_id: str | None = None,
     ) -> BookDocument:
         page = self._page(document, page_index)
         index = next((i for i, block in enumerate(page.blocks) if block.id == block_id), -1)
         if index < 0:
             raise KeyError(f"Text block not found: {block_id}")
         block = page.blocks[index]
-        if not isinstance(block, (ParagraphBlock, HeadingBlock)):
+        if not isinstance(block, (ParagraphBlock, HeadingBlock, PageHeaderBlock, PageFooterBlock)):
             raise ValueError("Only text blocks can be split")
         text = block.effective_text
         if offset <= 0 or offset >= len(text):
@@ -303,11 +348,21 @@ class DocumentEditor:
         raw_offset = min(offset, len(block.source_text_raw))
         normalized_offset = min(offset, len(block.source_text_normalized))
         mid_y = (block.bbox.y0 + block.bbox.y1) / 2
-        provenance = block.provenance.model_copy(update={"user_edited": True})
+        operation_ids = list(block.provenance.edit_operation_ids)
+        if operation_id is not None and operation_id not in operation_ids:
+            operation_ids.append(operation_id)
+        provenance = block.provenance.model_copy(
+            update={
+                "user_edited": True,
+                "derived_from_block_ids": [block.id],
+                "edit_operation_ids": operation_ids,
+            }
+        )
+        fingerprint = source_fingerprint(text)
         left = _make_text_block(
             block,
             heading=isinstance(block, HeadingBlock),
-            block_id=split_block_id(block.id, offset, "left"),
+            block_id=split_block_id(block.id, offset, "left", fingerprint),
             bbox=BBox(x0=block.bbox.x0, y0=block.bbox.y0, x1=block.bbox.x1, y1=mid_y),
             reading_order=block.reading_order,
             provenance=provenance,
@@ -319,7 +374,7 @@ class DocumentEditor:
         right = _make_text_block(
             block,
             heading=isinstance(block, HeadingBlock),
-            block_id=split_block_id(block.id, offset, "right"),
+            block_id=split_block_id(block.id, offset, "right", fingerprint),
             bbox=BBox(x0=block.bbox.x0, y0=mid_y, x1=block.bbox.x1, y1=block.bbox.y1),
             reading_order=block.reading_order + 1,
             provenance=provenance,

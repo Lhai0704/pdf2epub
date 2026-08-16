@@ -1,0 +1,1 @@
+"""Parser protocols and adapters."""

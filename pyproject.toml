@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdf2epub"
+version = "0.1.0"
+description = "Local-first workbench for turning digital PDFs into editable reflowable EPUBs"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "pdf2epub contributors" }]
+dependencies = [
+  "pydantic>=2.12,<3",
+  "pymupdf>=1.28,<1.29",
+  "pyside6-essentials>=6.11,<6.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/lhai0704/pdf2epub"
+Repository = "https://github.com/lhai0704/pdf2epub"
+Issues = "https://github.com/lhai0704/pdf2epub/issues"
+
+[project.scripts]
+pdf2epub = "pdf2epub.cli:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15,<2",
+  "pytest>=8,<10",
+  "pytest-qt>=4.5,<5",
+  "ruff>=0.14,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdf2epub"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["gui: PySide6 GUI smoke tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["PROJECT_SPEC.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["pdf2epub"]
+mypy_path = "src"
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["pymupdf", "PySide6.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+  "pdf2epub.fixtures",
+  "pdf2epub.pdf.*",
+  "pdf2epub.parsers.native_pdf",
+]
+disallow_untyped_calls = false

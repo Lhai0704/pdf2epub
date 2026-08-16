@@ -1,0 +1,12 @@
+.venv/
+.tools/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.bepub-project/
+tmp/
+tests/fixtures/generated/
+dist/
+build/

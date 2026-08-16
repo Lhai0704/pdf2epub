@@ -1,0 +1,1 @@
+"""Provider-neutral translation pipeline."""

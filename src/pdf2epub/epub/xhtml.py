@@ -14,6 +14,8 @@ BOOK_CSS = """body {
 }
 h1, h2, h3 { line-height: 1.25; margin: 1.4em 0 0.7em; }
 p.source { margin: 0 0 0.9em; text-indent: 1.5em; }
+p.translation { margin: 0 0 1.2em; text-indent: 1.5em; }
+.para { margin: 0; }
 img { display: block; max-width: 100%; height: auto; margin: 1em auto; }
 figure { margin: 1em 0; }
 """
@@ -30,7 +32,10 @@ def build_chapters(
     document: BookDocument,
     *,
     image_href: Callable[[str], str] | None = None,
+    mode: str = "original",
 ) -> list[Chapter]:
+    if mode not in {"original", "source_translation"}:
+        raise ValueError(f"Unsupported EPUB mode: {mode}")
     image_href = image_href or (lambda path: f"../images/{PurePosixPath(path).name}")
     chapters: list[Chapter] = []
     title = document.metadata.title
@@ -59,7 +64,26 @@ def build_chapters(
                 body.append(f'<h{block.level} id="{block.id}">{escaped}</h{block.level}>')
             elif isinstance(block, ParagraphBlock):
                 escaped = html.escape(block.effective_text, quote=False)
-                body.append(f'<p class="source" id="{block.id}">{escaped}</p>')
+                source_language = html.escape(document.metadata.language, quote=True)
+                paragraph = [
+                    f'<div class="para" id="{block.id}">',
+                    f'<p class="source" lang="{source_language}">{escaped}</p>',
+                ]
+                if (
+                    mode == "source_translation"
+                    and block.translation is not None
+                    and block.translation.status in {"translated", "user_edited"}
+                    and block.translation.text
+                ):
+                    target_language = html.escape(
+                        document.translation_settings.target_language, quote=True
+                    )
+                    translation = html.escape(block.translation.text, quote=False)
+                    paragraph.append(
+                        f'<p class="translation" lang="{target_language}">{translation}</p>'
+                    )
+                paragraph.append("</div>")
+                body.append("\n".join(paragraph))
             elif isinstance(block, ImageBlock):
                 asset = document.assets[block.asset_id]
                 source = html.escape(image_href(asset.relative_path), quote=True)
@@ -97,12 +121,14 @@ def chapter_xhtml(chapter: Chapter, language: str) -> str:
 """
 
 
-def preview_html(document: BookDocument, project_root_uri: str) -> str:
+def preview_html(
+    document: BookDocument, project_root_uri: str, *, mode: str = "source_translation"
+) -> str:
     def preview_image(path: str) -> str:
         relative = "/".join(PurePosixPath(path).parts)
         return f"{project_root_uri.rstrip('/')}/{relative}"
 
-    chapters = build_chapters(document, image_href=preview_image)
+    chapters = build_chapters(document, image_href=preview_image, mode=mode)
     body = "\n".join(chapter.body_html for chapter in chapters)
     language = html.escape(document.metadata.language, quote=True)
     return f"""<!DOCTYPE html>

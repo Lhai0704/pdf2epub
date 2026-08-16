@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -19,6 +20,7 @@ from pdf2epub.domain.models import (
     ProjectSource,
     SourceDocument,
 )
+from pdf2epub.persistence.migrations import migrate_document_payload
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024
 
@@ -112,6 +114,7 @@ class ProjectStore:
                 "assets/images",
                 "assets/page_previews",
                 "cache/parse",
+                "cache/translation",
                 "exports",
                 "logs",
             ):
@@ -131,7 +134,11 @@ class ProjectStore:
                 manifest_path.read_text(encoding="utf-8")
             )
             document_path = _resolve_project_path(root, manifest.document_path)
-            document = BookDocument.model_validate_json(document_path.read_text(encoding="utf-8"))
+            raw_document = json.loads(document_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_document, dict):
+                raise ValueError("document.json must contain a JSON object")
+            migrated_document, migrated_from = migrate_document_payload(raw_document)
+            document = BookDocument.model_validate(migrated_document)
             source_path = _resolve_project_path(root, manifest.source.relative_path)
             source_changed = (
                 not source_path.is_file() or sha256_file(source_path) != manifest.source.sha256
@@ -152,6 +159,7 @@ class ProjectStore:
             manifest=manifest,
             document=document,
             source_changed=source_changed,
+            migrated_from_schema=migrated_from,
         )
 
     def save(self, project: LoadedProject) -> LoadedProject:
@@ -160,7 +168,13 @@ class ProjectStore:
         manifest = project.manifest.model_copy(update={"updated_at": now})
         document = project.document.model_copy(update={"updated_at": now})
         self._save_models(root, manifest, document)
-        return project.model_copy(update={"manifest": manifest, "document": document})
+        return project.model_copy(
+            update={
+                "manifest": manifest,
+                "document": document,
+                "migrated_from_schema": None,
+            }
+        )
 
     @staticmethod
     def source_path(project: LoadedProject) -> Path:

@@ -4,6 +4,7 @@ import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThreadPool, Signal
@@ -31,12 +32,23 @@ from PySide6.QtWidgets import (
 
 from pdf2epub.application.editing import DocumentEditor
 from pdf2epub.application.workflow import BookWorkflow
-from pdf2epub.domain.models import BookDocument, HeadingBlock, ImageBlock, LoadedProject, Page
-from pdf2epub.epub.builder import EpubBuilder
+from pdf2epub.domain.models import (
+    BookDocument,
+    HeadingBlock,
+    ImageBlock,
+    LoadedProject,
+    Page,
+    ParagraphBlock,
+)
+from pdf2epub.epub.builder import EpubBuilder, EpubBuildOptions
 from pdf2epub.epub.validator import EpubValidator
 from pdf2epub.epub.xhtml import preview_html
 from pdf2epub.gui.page_view import PdfPageView
-from pdf2epub.gui.workers import FunctionWorker
+from pdf2epub.gui.translation_view import TranslationView
+from pdf2epub.gui.workers import AsyncProgressWorker, FunctionWorker
+from pdf2epub.translation.base import BatchItemResult, BatchTranslationResult, Translator
+from pdf2epub.translation.providers.longcat import LONGCAT_ENDPOINT, LongCatProvider
+from pdf2epub.translation.service import TranslationService
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,23 +76,30 @@ class MainWindow(QMainWindow):
         *,
         workflow: BookWorkflow | None = None,
         epubcheck_jar: Path | None = None,
+        translator_factory: Callable[[], Translator] | None = None,
+        require_translation_consent: bool = True,
+        confirm_incomplete_export: bool = True,
     ) -> None:
         super().__init__()
         self.project = project
         self.workflow = workflow or BookWorkflow()
         self.editor_service = DocumentEditor()
         self.epubcheck_jar = epubcheck_jar
+        self.translator_factory = translator_factory or LongCatProvider
+        self.require_translation_consent = require_translation_consent
+        self.confirm_incomplete_export = confirm_incomplete_export
         self.thread_pool = QThreadPool.globalInstance()
         self.cancel_event = threading.Event()
         self.current_page_index = 0
         self.current_block_id: str | None = None
         self._page_loading = False
         self._pending_page_index: int | None = None
-        self._active_workers: set[FunctionWorker] = set()
+        self._active_workers: set[FunctionWorker | AsyncProgressWorker] = set()
         self.setWindowTitle(f"pdf2epub — {project.document.metadata.title}")
         self.resize(1280, 800)
         self._build_ui()
         self._refresh_page_list()
+        self.translation_view.refresh(self.project.document)
         self._refresh_preview()
         if self.project.document.pages:
             self.page_list.setCurrentRow(0)
@@ -100,7 +119,14 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.page_view)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._structure_tab(), "Structure")
+        self.structure_widget = self._structure_tab()
+        self.tabs.addTab(self.structure_widget, "Structure")
+        self.translation_view = TranslationView()
+        self.translation_view.translate_requested.connect(self.translate_paragraphs)
+        self.translation_view.retry_requested.connect(self.translate_paragraphs)
+        self.translation_view.translation_edit_requested.connect(self.apply_translation_edit)
+        self.translation_view.languages_changed.connect(self.apply_languages)
+        self.tabs.addTab(self.translation_view, "Translation")
         self.preview = QTextBrowser()
         self.preview.setOpenExternalLinks(False)
         self.preview.setObjectName("epubPreview")
@@ -121,15 +147,15 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_event.set)
-        export_button = QPushButton("Export EPUB…")
-        export_button.clicked.connect(self._choose_export)
-        save_button = QPushButton("Save Project")
-        save_button.clicked.connect(self.save_project)
+        self.export_button = QPushButton("Export EPUB…")
+        self.export_button.clicked.connect(self._choose_export)
+        self.save_button = QPushButton("Save Project")
+        self.save_button.clicked.connect(self.save_project)
         status_row.addWidget(self.status_label, 1)
         status_row.addWidget(self.progress)
         status_row.addWidget(self.cancel_button)
-        status_row.addWidget(save_button)
-        status_row.addWidget(export_button)
+        status_row.addWidget(self.save_button)
+        status_row.addWidget(self.export_button)
         root_layout.addLayout(status_row)
         self.setCentralWidget(central)
 
@@ -220,6 +246,8 @@ class MainWindow(QMainWindow):
         self.page_view.show_page(result.image_path, page)
         self._refresh_blocks()
         self._refresh_page_list()
+        self.translation_view.refresh(self.project.document)
+        self._refresh_preview()
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
         self.status_label.setText(f"Page {result.page_index + 1} ready")
@@ -318,12 +346,143 @@ class MainWindow(QMainWindow):
         self._refresh_blocks()
         self._select_block_by_id(select_id)
         self._refresh_preview()
+        self.translation_view.refresh(self.project.document)
         self.document_changed.emit()
         self.status_label.setText("Project saved")
 
     def save_project(self) -> None:
         self.project = self.workflow.store.save(self.project)
         self.status_label.setText("Project saved")
+
+    def apply_translation_edit(self, paragraph_id: str, text: str) -> None:
+        try:
+            document = self.editor_service.edit_translation(
+                self.project.document, paragraph_id, text
+            )
+        except (KeyError, ValueError) as exc:
+            QMessageBox.warning(self, "pdf2epub", str(exc))
+            return
+        self._commit_document(document, self.current_block_id or paragraph_id)
+
+    def apply_languages(self, source_language: str, target_language: str) -> None:
+        settings = self.project.document.translation_settings.model_copy(
+            update={"target_language": target_language}
+        )
+        try:
+            document = self.editor_service.update_translation_settings(
+                self.project.document,
+                source_language=source_language,
+                settings=settings,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "pdf2epub", str(exc))
+            return
+        self._commit_document(document, self.current_block_id or "")
+
+    def translate_paragraphs(self, paragraph_ids: list[str]) -> None:
+        if not paragraph_ids:
+            return
+        if self._page_loading:
+            self.status_label.setText("Wait for the current page to finish loading")
+            return
+        settings = self.project.document.translation_settings
+        if self.require_translation_consent and settings.remote_consent_at is None:
+            answer = QMessageBox.question(
+                self,
+                "Send text to LongCat?",
+                "The selected paragraph, its adjacent paragraphs, chapter heading, glossary, "
+                f"and style instructions will be sent to {LONGCAT_ENDPOINT}. "
+                "Network retries may cause duplicate billing. Continue?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            settings = settings.model_copy(update={"remote_consent_at": datetime.now(UTC)})
+            document = self.project.document.model_copy(update={"translation_settings": settings})
+            self.project = self.workflow.store.save(
+                self.project.model_copy(update={"document": document})
+            )
+
+        self.cancel_event.clear()
+        self.cancel_button.setEnabled(True)
+        self.translation_view.set_busy(True)
+        self.structure_widget.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.page_list.setEnabled(False)
+        self.progress.setRange(0, len(paragraph_ids))
+        self.progress.setValue(0)
+        self.status_label.setText("Translating selected paragraphs…")
+        for paragraph_id in paragraph_ids:
+            self.translation_view.set_task_status(paragraph_id, "queued")
+
+        batch_project = self.project
+
+        async def task(
+            progress: Callable[[int, int, object], None],
+        ) -> BatchTranslationResult:
+            translator = self.translator_factory()
+            service = TranslationService(translator, store=self.workflow.store)
+            try:
+                return await service.translate_selection(
+                    batch_project,
+                    paragraph_ids,
+                    progress=lambda current, total, item: progress(current, total, item),
+                    cancelled=self.cancel_event.is_set,
+                )
+            finally:
+                if isinstance(translator, LongCatProvider):
+                    await translator.aclose()
+
+        worker = AsyncProgressWorker(task)
+        self._active_workers.add(worker)
+        worker.signals.progress.connect(self._translation_progress)
+
+        def finished(result: object) -> None:
+            self._active_workers.discard(worker)
+            self._translation_ready(result)
+
+        def failed(message: str) -> None:
+            self._active_workers.discard(worker)
+            self._operation_failed(message)
+
+        worker.signals.finished.connect(finished)
+        worker.signals.error.connect(failed)
+        self.thread_pool.start(worker)
+
+    def _translation_progress(self, current: int, total: int, item: object) -> None:
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(current)
+        if isinstance(item, BatchItemResult):
+            if item.status in {"queued", "translating"}:
+                self.translation_view.set_task_status(item.paragraph_id, item.status)
+            self.status_label.setText(
+                f"Translation {current}/{total}: {item.status} ({item.paragraph_id})"
+            )
+
+    def _translation_ready(self, result: object) -> None:
+        if not isinstance(result, BatchTranslationResult):
+            raise TypeError("Unexpected translation worker result")
+        self.project = result.project
+        self.translation_view.clear_task_statuses()
+        self.cancel_button.setEnabled(False)
+        self.translation_view.set_busy(False)
+        self.structure_widget.setEnabled(True)
+        self.save_button.setEnabled(True)
+        self.export_button.setEnabled(True)
+        self.page_list.setEnabled(True)
+        self.translation_view.refresh(self.project.document)
+        self._refresh_preview()
+        message = (
+            f"Translation finished: {result.translated_count} translated, "
+            f"{result.cache_hit_count} cache hits, {result.failed_count} failed"
+        )
+        if result.cancelled:
+            message += "; cancelled"
+        if result.fatal_error:
+            message += f"; {result.fatal_error}"
+        self.status_label.setText(message)
+        self.logs.appendPlainText(message)
+        self.document_changed.emit()
 
     def _refresh_preview(self) -> None:
         project_uri = Path(self.project.root).resolve().as_uri()
@@ -341,6 +500,26 @@ class MainWindow(QMainWindow):
             self.export_to(Path(selected))
 
     def export_to(self, output: Path) -> None:
+        incomplete = sum(
+            isinstance(block, ParagraphBlock)
+            and (
+                block.translation is None
+                or block.translation.status not in {"translated", "user_edited"}
+            )
+            for page in self.project.document.pages
+            for block in page.blocks
+        )
+        unparsed_pages = sum(page.parse_status != "parsed" for page in self.project.document.pages)
+        if (incomplete or unparsed_pages) and self.confirm_incomplete_export:
+            answer = QMessageBox.question(
+                self,
+                "Incomplete bilingual content",
+                f"{incomplete} paragraphs do not have a valid translation. "
+                f"{unparsed_pages} pages are not parsed and may add untranslated paragraphs. "
+                "Export a valid but incomplete bilingual EPUB anyway?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         self.cancel_event.clear()
         self.cancel_button.setEnabled(True)
         self.progress.setRange(0, 0)
@@ -350,7 +529,12 @@ class MainWindow(QMainWindow):
             project, _ = self.workflow.parse_all(self.project, cancelled=self.cancel_event.is_set)
             if self.cancel_event.is_set():
                 return ExportResult(project, False, "Export cancelled")
-            build = EpubBuilder().build(project.document, Path(project.root), output)
+            build = EpubBuilder().build(
+                project.document,
+                Path(project.root),
+                output,
+                options=EpubBuildOptions(mode="source_translation"),
+            )
             report = EpubValidator(self.epubcheck_jar).validate(output)
             message = (
                 f"EPUB validation: {'PASS' if report.passed else 'FAILED'} — "
@@ -369,6 +553,9 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
+        self._refresh_page_list()
+        self.translation_view.refresh(self.project.document)
+        self._refresh_preview()
         self.status_label.setText(result.message)
         self.logs.appendPlainText(result.message)
         self.export_finished.emit(result.passed, result.message)
@@ -383,17 +570,26 @@ class MainWindow(QMainWindow):
 
         def failed(message: str) -> None:
             self._active_workers.discard(worker)
-            self._page_loading = False
-            self._pending_page_index = None
-            self.progress.setRange(0, 1)
-            self.cancel_button.setEnabled(False)
-            self.status_label.setText("Operation failed")
-            self.logs.appendPlainText(message)
-            QMessageBox.critical(self, "pdf2epub", message)
+            self._operation_failed(message)
 
         worker.signals.finished.connect(finished)
         worker.signals.error.connect(failed)
         self.thread_pool.start(worker)
+
+    def _operation_failed(self, message: str) -> None:
+        self._page_loading = False
+        self._pending_page_index = None
+        self.translation_view.clear_task_statuses()
+        self.progress.setRange(0, 1)
+        self.cancel_button.setEnabled(False)
+        self.translation_view.set_busy(False)
+        self.structure_widget.setEnabled(True)
+        self.save_button.setEnabled(True)
+        self.export_button.setEnabled(True)
+        self.page_list.setEnabled(True)
+        self.status_label.setText("Operation failed")
+        self.logs.appendPlainText(message)
+        QMessageBox.critical(self, "pdf2epub", message)
 
     def _current_page(self) -> Page:
         return next(

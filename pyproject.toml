@@ -12,6 +12,7 @@ license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "pdf2epub contributors" }]
 dependencies = [
+  "httpx>=0.28,<1",
   "pydantic>=2.12,<3",
   "pymupdf>=1.28,<1.29",
   "pyside6-essentials>=6.11,<6.12",

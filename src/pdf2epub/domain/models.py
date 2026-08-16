@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -64,6 +66,84 @@ class ProcessingProvenance(StrictModel):
     user_edited: bool = False
 
 
+TranslationStatus = Literal[
+    "untranslated",
+    "queued",
+    "translating",
+    "translated",
+    "failed",
+    "user_edited",
+    "stale",
+]
+
+
+class GlossaryEntry(StrictModel):
+    source: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+
+
+class TranslationSettings(StrictModel):
+    target_language: str = Field(default="zh-CN", min_length=1)
+    provider_id: str = Field(default="longcat", min_length=1)
+    model: str = Field(default="LongCat-2.0", min_length=1)
+    prompt_version: str = Field(default="translate-v1", min_length=1)
+    glossary: list[GlossaryEntry] = Field(default_factory=list)
+    style_instructions: str | None = None
+    remote_consent_at: datetime | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def glossary_version(self) -> str:
+        payload = json.dumps(
+            [
+                entry.model_dump()
+                for entry in sorted(self.glossary, key=lambda value: (value.source, value.target))
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class TranslationUsage(StrictModel):
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+
+class TranslationProvenance(StrictModel):
+    origin: Literal["provider", "cache", "manual"]
+    provider_id: str
+    model: str
+    prompt_version: str
+    glossary_version: str = Field(min_length=64, max_length=64)
+    request_id: str | None = None
+    usage: TranslationUsage | None = None
+
+
+class TranslationRecord(StrictModel):
+    text: str | None = None
+    status: Literal["translated", "failed", "user_edited", "stale"]
+    source_fingerprint: str = Field(min_length=64, max_length=64)
+    cache_key: str | None = Field(default=None, min_length=64, max_length=64)
+    provenance: TranslationProvenance
+    error_code: str | None = None
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def validate_translation(self) -> TranslationRecord:
+        if self.status in {"translated", "user_edited"} and not (self.text or "").strip():
+            raise ValueError("valid translations require non-empty text")
+        if self.status == "translated" and self.provenance.origin == "manual":
+            raise ValueError("provider translations cannot have manual provenance")
+        if self.status == "user_edited" and self.provenance.origin != "manual":
+            raise ValueError("user-edited translations require manual provenance")
+        return self
+
+
 class BlockBase(StrictModel):
     id: str
     bbox: BBox
@@ -87,6 +167,7 @@ class TextBlockBase(BlockBase):
 
 class ParagraphBlock(TextBlockBase):
     type: Literal["paragraph"] = "paragraph"
+    translation: TranslationRecord | None = None
 
 
 class HeadingBlock(TextBlockBase):
@@ -170,12 +251,13 @@ class SourceDocument(StrictModel):
 
 
 class BookDocument(StrictModel):
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.1"] = "1.1"
     document_id: str
     metadata: BookMetadata
     source: SourceDocument
     pages: list[Page] = Field(default_factory=list)
     assets: dict[str, Asset] = Field(default_factory=dict)
+    translation_settings: TranslationSettings = Field(default_factory=TranslationSettings)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -233,3 +315,4 @@ class LoadedProject(StrictModel):
     manifest: ProjectManifest
     document: BookDocument
     source_changed: bool = False
+    migrated_from_schema: str | None = None

@@ -12,7 +12,11 @@ from pdf2epub.domain.models import (
     ProcessingProvenance,
     TextBlock,
     TextStyle,
+    TranslationProvenance,
+    TranslationRecord,
+    TranslationSettings,
 )
+from pdf2epub.translation.cache import source_fingerprint
 
 
 def _join_text(left: str, right: str) -> str:
@@ -53,7 +57,7 @@ def _make_text_block(
 
 
 class DocumentEditor:
-    """Small M1 editor. Every operation returns a newly validated document."""
+    """Auditable source/translation editor returning newly validated documents."""
 
     def edit_text(
         self, document: BookDocument, page_index: int, block_id: str, text: str
@@ -63,10 +67,23 @@ class DocumentEditor:
         found = False
         for block in page.blocks:
             if block.id == block_id and isinstance(block, (ParagraphBlock, HeadingBlock)):
+                previous_fingerprint = source_fingerprint(block.effective_text)
                 provenance = block.provenance.model_copy(update={"user_edited": True})
                 block = block.model_copy(
                     update={"source_text_user": text, "provenance": provenance}
                 )
+                if (
+                    isinstance(block, ParagraphBlock)
+                    and block.translation is not None
+                    and source_fingerprint(block.effective_text) != previous_fingerprint
+                ):
+                    block = block.model_copy(
+                        update={
+                            "translation": block.translation.model_copy(
+                                update={"status": "stale", "updated_at": datetime.now(UTC)}
+                            )
+                        }
+                    )
                 found = True
             blocks.append(block)
         if not found:
@@ -109,6 +126,9 @@ class DocumentEditor:
                         source_text_normalized=block.source_text_normalized,
                         source_text_user=block.source_text_user,
                         style=block.style,
+                        translation=block.translation
+                        if isinstance(block, ParagraphBlock)
+                        else None,
                     )
                 else:
                     raise ValueError("M1 supports only paragraph and heading types")
@@ -117,6 +137,102 @@ class DocumentEditor:
         if not found:
             raise KeyError(f"Text block not found: {block_id}")
         return self._replace_page(document, page.model_copy(update={"blocks": blocks}))
+
+    def edit_translation(
+        self, document: BookDocument, paragraph_id: str, text: str
+    ) -> BookDocument:
+        clean_text = text.strip()
+        if not clean_text:
+            raise ValueError("Translation text cannot be empty")
+        settings = document.translation_settings
+        pages = []
+        found = False
+        for page in document.pages:
+            blocks = []
+            page_changed = False
+            for block in page.blocks:
+                if block.id == paragraph_id and isinstance(block, ParagraphBlock):
+                    previous = block.translation
+                    previous_provenance = previous.provenance if previous else None
+                    record = TranslationRecord(
+                        text=clean_text,
+                        status="user_edited",
+                        source_fingerprint=source_fingerprint(block.effective_text),
+                        provenance=TranslationProvenance(
+                            origin="manual",
+                            provider_id=(
+                                previous_provenance.provider_id
+                                if previous_provenance
+                                else settings.provider_id
+                            ),
+                            model=(
+                                previous_provenance.model if previous_provenance else settings.model
+                            ),
+                            prompt_version=(
+                                previous_provenance.prompt_version
+                                if previous_provenance
+                                else settings.prompt_version
+                            ),
+                            glossary_version=(
+                                previous_provenance.glossary_version
+                                if previous_provenance
+                                else settings.glossary_version
+                            ),
+                            request_id=(previous.provenance.request_id if previous else None),
+                        ),
+                        created_at=previous.created_at if previous else datetime.now(UTC),
+                    )
+                    block = block.model_copy(update={"translation": record})
+                    found = True
+                    page_changed = True
+                blocks.append(block)
+            pages.append(page.model_copy(update={"blocks": blocks}) if page_changed else page)
+        if not found:
+            raise KeyError(f"Paragraph not found: {paragraph_id}")
+        return document.model_copy(update={"pages": pages, "updated_at": datetime.now(UTC)})
+
+    def update_translation_settings(
+        self,
+        document: BookDocument,
+        *,
+        source_language: str,
+        settings: TranslationSettings,
+    ) -> BookDocument:
+        source_language = source_language.strip()
+        if not source_language or not settings.target_language.strip():
+            raise ValueError("Source and target languages are required")
+        previous = document.translation_settings
+        affecting_previous = previous.model_dump(exclude={"remote_consent_at"})
+        affecting_next = settings.model_dump(exclude={"remote_consent_at"})
+        should_stale = document.metadata.language != source_language or (
+            affecting_previous != affecting_next
+        )
+        metadata = document.metadata.model_copy(update={"language": source_language})
+        pages = document.pages
+        if should_stale:
+            pages = []
+            for page in document.pages:
+                blocks = [
+                    block.model_copy(
+                        update={
+                            "translation": block.translation.model_copy(
+                                update={"status": "stale", "updated_at": datetime.now(UTC)}
+                            )
+                        }
+                    )
+                    if isinstance(block, ParagraphBlock) and block.translation is not None
+                    else block
+                    for block in page.blocks
+                ]
+                pages.append(page.model_copy(update={"blocks": blocks}))
+        return document.model_copy(
+            update={
+                "metadata": metadata,
+                "translation_settings": settings,
+                "pages": pages,
+                "updated_at": datetime.now(UTC),
+            }
+        )
 
     def merge_adjacent(
         self, document: BookDocument, page_index: int, first_block_id: str

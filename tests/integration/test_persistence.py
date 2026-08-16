@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -49,3 +50,55 @@ def test_project_suffix_is_required(fixture_corpus: Path, tmp_path: Path) -> Non
         ProjectStore().create(
             tmp_path / "not-a-project", fixture_corpus / "digital_single_column.pdf"
         )
+
+
+def test_m1_document_is_migrated_in_memory_then_saved_as_1_1(
+    fixture_corpus: Path, tmp_path: Path
+) -> None:
+    workflow = BookWorkflow()
+    root = tmp_path / "legacy.bepub-project"
+    project = workflow.create_project(root, fixture_corpus / "digital_single_column.pdf")
+    project, _ = workflow.parse_page(project, 0)
+    document_path = root / "document.json"
+    payload = json.loads(document_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "1.0"
+    payload.pop("translation_settings")
+    for page in payload["pages"]:
+        for block in page["blocks"]:
+            block.pop("translation", None)
+    document_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = workflow.load_project(root)
+    assert loaded.migrated_from_schema == "1.0"
+    assert loaded.document.schema_version == "1.1"
+    assert loaded.document.pages[0].blocks[0].id == project.document.pages[0].blocks[0].id
+    saved = workflow.store.save(loaded)
+    assert saved.migrated_from_schema is None
+    assert json.loads(document_path.read_text(encoding="utf-8"))["schema_version"] == "1.1"
+
+
+@pytest.mark.parametrize("invalid_shape", ["future-schema", "extra-field", "task-status"])
+def test_invalid_document_shapes_are_rejected(
+    invalid_shape: str, fixture_corpus: Path, tmp_path: Path
+) -> None:
+    workflow = BookWorkflow()
+    root = tmp_path / f"invalid-{invalid_shape}.bepub-project"
+    project = workflow.create_project(root, fixture_corpus / "digital_single_column.pdf")
+    project, _ = workflow.parse_page(project, 0)
+    document_path = root / "document.json"
+    payload = json.loads(document_path.read_text(encoding="utf-8"))
+    if invalid_shape == "future-schema":
+        payload["schema_version"] = "2.0"
+    elif invalid_shape == "extra-field":
+        payload["unexpected"] = True
+    else:
+        paragraph = next(
+            block
+            for page in payload["pages"]
+            for block in page["blocks"]
+            if block["type"] == "paragraph"
+        )
+        paragraph["translation"] = {"status": "translating"}
+    document_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ProjectPersistenceError):
+        workflow.load_project(root)

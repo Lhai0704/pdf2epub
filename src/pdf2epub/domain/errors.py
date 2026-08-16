@@ -27,3 +27,24 @@ class EpubBuildError(Pdf2EpubError):
 
 class EpubValidationError(Pdf2EpubError):
     """EPUBCheck could not run or found conformance errors."""
+
+
+class TranslationError(Pdf2EpubError):
+    """Base error for expected translation failures."""
+
+
+class TranslationConfigurationError(TranslationError):
+    """Translation provider settings or credentials are unavailable."""
+
+
+class TranslationProviderError(TranslationError):
+    """A translation provider rejected or failed a request."""
+
+    def __init__(self, message: str, *, code: str = "provider_error", fatal: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.fatal = fatal
+
+
+class TranslationCacheError(TranslationError):
+    """The project translation cache could not be read or written safely."""

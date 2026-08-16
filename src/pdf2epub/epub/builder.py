@@ -6,6 +6,7 @@ import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -19,6 +20,11 @@ class EpubBuildResult(BaseModel):
     output_path: str
     chapter_count: int
     warnings: list[str]
+
+
+class EpubBuildOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mode: Literal["original", "source_translation"] = "original"
 
 
 def _container_xml() -> str:
@@ -52,7 +58,9 @@ def _nav_xhtml(title: str, language: str, chapters: list[tuple[str, str]]) -> st
 """
 
 
-def _package_opf(document: BookDocument, chapter_files: list[str]) -> str:
+def _package_opf(
+    document: BookDocument, chapter_files: list[str], options: EpubBuildOptions
+) -> str:
     creator = (
         f"    <dc:creator>{html.escape(document.metadata.creator)}</dc:creator>\n"
         if document.metadata.creator
@@ -74,6 +82,12 @@ def _package_opf(document: BookDocument, chapter_files: list[str]) -> str:
     )
     modified = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     escaped_language = html.escape(document.metadata.language, quote=True)
+    escaped_target_language = html.escape(document.translation_settings.target_language)
+    target_language = (
+        f"    <dc:language>{escaped_target_language}</dc:language>\n"
+        if options.mode == "source_translation"
+        else ""
+    )
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0"
          unique-identifier="book-id" xml:lang="{escaped_language}">
@@ -81,7 +95,7 @@ def _package_opf(document: BookDocument, chapter_files: list[str]) -> str:
     <dc:identifier id="book-id">{html.escape(document.document_id)}</dc:identifier>
     <dc:title>{html.escape(document.metadata.title)}</dc:title>
     <dc:language>{html.escape(document.metadata.language)}</dc:language>
-{creator}    <meta property="dcterms:modified">{modified}</meta>
+{target_language}{creator}    <meta property="dcterms:modified">{modified}</meta>
   </metadata>
   <manifest>
     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav" />
@@ -97,9 +111,17 @@ def _package_opf(document: BookDocument, chapter_files: list[str]) -> str:
 
 
 class EpubBuilder:
-    def build(self, document: BookDocument, project_root: Path, output: Path) -> EpubBuildResult:
-        chapters = build_chapters(document)
-        warnings = self._content_warnings(document, chapters)
+    def build(
+        self,
+        document: BookDocument,
+        project_root: Path,
+        output: Path,
+        *,
+        options: EpubBuildOptions | None = None,
+    ) -> EpubBuildResult:
+        options = options or EpubBuildOptions()
+        chapters = build_chapters(document, mode=options.mode)
+        warnings = self._content_warnings(document, chapters, options)
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         try:
@@ -116,7 +138,7 @@ class EpubBuilder:
                 archive.writestr("META-INF/container.xml", _container_xml())
                 archive.writestr(
                     "EPUB/package.opf",
-                    _package_opf(document, [chapter.file_name for chapter in chapters]),
+                    _package_opf(document, [chapter.file_name for chapter in chapters], options),
                 )
                 archive.writestr(
                     "EPUB/nav.xhtml",
@@ -150,7 +172,9 @@ class EpubBuilder:
         )
 
     @staticmethod
-    def _content_warnings(document: BookDocument, chapters: list[Chapter]) -> list[str]:
+    def _content_warnings(
+        document: BookDocument, chapters: list[Chapter], options: EpubBuildOptions
+    ) -> list[str]:
         warnings: list[str] = []
         ids = [
             block.id
@@ -168,4 +192,21 @@ class EpubBuilder:
                     and combined.count(f'id="{block.id}"') != 1
                 ):
                     warnings.append(f"Block {block.id} was not serialized exactly once")
+        if options.mode == "source_translation":
+            incomplete = [
+                block
+                for page in document.pages
+                for block in page.blocks
+                if isinstance(block, ParagraphBlock)
+                and (
+                    block.translation is None
+                    or block.translation.status not in {"translated", "user_edited"}
+                    or not block.translation.text
+                )
+            ]
+            if incomplete:
+                warnings.append(
+                    "Bilingual content incomplete: "
+                    f"{len(incomplete)} paragraphs lack a valid translation"
+                )
         return warnings

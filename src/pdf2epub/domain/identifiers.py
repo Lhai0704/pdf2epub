@@ -45,3 +45,23 @@ def split_block_id(parent_id: str, split_offset: int, side: str) -> str:
 
 def stable_asset_id(content_sha256: str) -> str:
     return f"asset-{content_sha256[:20]}"
+
+
+def stable_ocr_block_id(
+    source_sha256: str,
+    page_index: int,
+    parser_id: str,
+    model_identity: str,
+    bbox: tuple[float, float, float, float],
+    raw_element_id: str,
+) -> str:
+    quantized = ",".join(f"{value:.2f}" for value in bbox)
+    identity = (
+        source_sha256,
+        str(page_index),
+        parser_id,
+        model_identity,
+        quantized,
+        raw_element_id,
+    )
+    return f"ocr-{_stable_hash(identity)}"

@@ -18,6 +18,27 @@ dependencies = [
   "pyside6-essentials>=6.11,<6.12",
 ]
 
+[project.optional-dependencies]
+ocr-cpu = [
+  "paddleocr[doc-parser]==3.7.0",
+  "paddlepaddle==3.3.0",
+]
+ocr-gpu = [
+  "paddleocr[doc-parser]==3.7.0",
+  "paddlepaddle-gpu==3.3.0",
+  # Paddle 3.3.0 publishes inconsistent Linux/Windows wheel metadata. Keep the
+  # Windows CUDA runtime requirements explicit so uv's universal lock does not
+  # discard them behind Linux-only markers.
+  "nvidia-cublas==13.0.2.14; sys_platform == 'win32'",
+  "nvidia-cuda-runtime==13.0.88; sys_platform == 'win32'",
+  "nvidia-cudnn-cu13==9.13.0.50; sys_platform == 'win32'",
+  "nvidia-cufft==12.0.0.61; sys_platform == 'win32'",
+  "nvidia-curand==10.4.0.35; sys_platform == 'win32'",
+  "nvidia-cusolver==12.0.4.66; sys_platform == 'win32'",
+  "nvidia-cusparse==12.6.3.3; sys_platform == 'win32'",
+  "nvidia-nvjitlink==13.0.88; sys_platform == 'win32'",
+]
+
 [project.urls]
 Homepage = "https://github.com/lhai0704/pdf2epub"
 Repository = "https://github.com/lhai0704/pdf2epub"
@@ -33,6 +54,28 @@ dev = [
   "pytest-qt>=4.5,<5",
   "ruff>=0.14,<1",
 ]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "ocr-cpu" },
+    { extra = "ocr-gpu" },
+  ],
+]
+
+[tool.uv.sources]
+paddlepaddle = [{ index = "paddle-cpu", extra = "ocr-cpu" }]
+paddlepaddle-gpu = [{ index = "paddle-cu130", extra = "ocr-gpu" }]
+
+[[tool.uv.index]]
+name = "paddle-cpu"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"
+explicit = true
+
+[[tool.uv.index]]
+name = "paddle-cu130"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu130/"
+explicit = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pdf2epub"]
@@ -61,7 +104,7 @@ mypy_path = "src"
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["pymupdf", "PySide6.*"]
+module = ["pymupdf", "PySide6.*", "paddleocr"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -69,5 +112,7 @@ module = [
   "pdf2epub.fixtures",
   "pdf2epub.pdf.*",
   "pdf2epub.parsers.native_pdf",
+  "pdf2epub.parsers.paddle_structure",
+  "pdf2epub.parsers.ocr_normalization",
 ]
 disallow_untyped_calls = false

@@ -6,7 +6,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import pymupdf
 
@@ -23,6 +23,7 @@ from pdf2epub.domain.models import (
 )
 from pdf2epub.parsers.base import PageContext, PageParseResult, ParseOptions
 from pdf2epub.pdf.analyzer import native_text_quality
+from pdf2epub.pdf.classifier import classify_page
 from pdf2epub.persistence.project_store import atomic_write_json
 from pdf2epub.structure.layout import LayoutItem, order_layout_items
 from pdf2epub.structure.paragraphs import ExtractedLine, build_text_blocks
@@ -44,6 +45,8 @@ def _bbox_tuple(value: object) -> tuple[float, float, float, float]:
 class NativePdfParser:
     parser_id = "pymupdf_native"
     parser_version = pymupdf.VersionBind
+    capabilities: tuple[str, ...] = ("pdf", "native_text", "embedded_images")
+    cancellation_boundary: Literal["page"] = "page"
 
     def can_parse(self, context: PageContext) -> bool:
         return context.source_path.suffix.casefold() == ".pdf" and context.source_path.is_file()
@@ -115,7 +118,7 @@ class NativePdfParser:
                 if not isinstance(image_data, bytes):
                     continue
                 bbox = BBox.from_tuple(_bbox_tuple(block["bbox"]))
-                image_area += (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0)
+                image_area = max(image_area, (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0))
                 image = _ImagePayload(
                     bbox=bbox,
                     data=image_data,
@@ -190,15 +193,25 @@ class NativePdfParser:
             block.model_copy(update={"reading_order": index}) for index, block in enumerate(blocks)
         ]
         quality = native_text_quality(" ".join(all_text), image_area, rect.width * rect.height)
+        classification = classify_page(quality, rotation)
+        warnings = (
+            ["native_content_may_be_incomplete"]
+            if classification.recommended_parser == "paddle_ppstructure_v3"
+            else []
+        )
         result_page = Page(
             page_index=context.page_index,
             width=rect.width,
             height=rect.height,
             rotation=rotation,
             parser_id=self.parser_id,
+            parser_version=self.parser_version,
+            parser_options=options.model_dump(),
             parse_status="parsed",
             parse_fingerprint=fingerprint,
+            parse_warnings=warnings,
             quality=quality,
+            classification=classification,
             blocks=blocks,
         )
         return PageParseResult(result_page, tuple(assets.values()), fingerprint)

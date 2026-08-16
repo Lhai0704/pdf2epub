@@ -1296,6 +1296,12 @@ Codex 应先做以下小实验并记录结论：
 
 只在少量扫描/复杂页面对比，不要一开始把两者都做成生产代码。
 
+M3 implementation note (2026-08-16): the empirical target-device spike is limited to
+PaddleOCR/PP-StructureV3. MinerU is desk research only and remains an M5 candidate; installing its
+dependencies or downloading its models requires a separate explicit approval. This is the minimum
+scope correction needed to honor the M3 local-environment constraint without adding a second
+production parser.
+
 ---
 
 # 29. 产品验收标准

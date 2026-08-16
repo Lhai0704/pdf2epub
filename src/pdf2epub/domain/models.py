@@ -64,6 +64,13 @@ class ProcessingProvenance(StrictModel):
     raw_cache_path: str | None = None
     warnings: list[str] = Field(default_factory=list)
     user_edited: bool = False
+    provider_id: str | None = None
+    engine: str | None = None
+    device: str | None = None
+    precision: str | None = None
+    model_versions: dict[str, str] = Field(default_factory=dict)
+    raw_payload_schema: str | None = None
+    raw_element_ids: list[str] = Field(default_factory=list)
 
 
 TranslationStatus = Literal[
@@ -149,6 +156,7 @@ class BlockBase(StrictModel):
     bbox: BBox
     reading_order: int = Field(ge=0)
     provenance: ProcessingProvenance
+    confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class TextBlockBase(BlockBase):
@@ -181,8 +189,16 @@ class ImageBlock(BlockBase):
     alt_text: str = ""
 
 
-Block = Annotated[ParagraphBlock | HeadingBlock | ImageBlock, Field(discriminator="type")]
-TextBlock = ParagraphBlock | HeadingBlock
+class CaptionBlock(TextBlockBase):
+    type: Literal["caption"] = "caption"
+    for_asset_id: str
+
+
+Block = Annotated[
+    ParagraphBlock | HeadingBlock | ImageBlock | CaptionBlock,
+    Field(discriminator="type"),
+]
+TextBlock = ParagraphBlock | HeadingBlock | CaptionBlock
 
 
 class NativeTextQuality(StrictModel):
@@ -194,14 +210,39 @@ class NativeTextQuality(StrictModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+ParserChoice = Literal["native", "paddle_ppstructure_v3"]
+ParserOverride = Literal["auto", "native", "paddle_ppstructure_v3"]
+
+
+class PageClassification(StrictModel):
+    kind: Literal["digital", "scanned", "image_text_layer", "suspect", "blank"]
+    confidence: float = Field(ge=0, le=1)
+    reasons: list[str] = Field(default_factory=list)
+    recommended_parser: ParserChoice
+    classifier_version: str = "native-signals-v1"
+
+
+class PageParseError(StrictModel):
+    code: str
+    message: str
+    fatal: bool = False
+
+
 class Page(StrictModel):
     page_index: int = Field(ge=0)
     width: float = Field(gt=0)
     height: float = Field(gt=0)
     rotation: int = 0
-    parser_id: str = "pymupdf_native"
+    parser_id: str | None = None
+    parser_version: str | None = None
+    parser_options: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    model_versions: dict[str, str] = Field(default_factory=dict)
+    parser_override: ParserOverride = "auto"
+    classification: PageClassification | None = None
     parse_status: Literal["unparsed", "parsed", "stale", "failed"] = "unparsed"
     parse_fingerprint: str | None = None
+    parse_error: PageParseError | None = None
+    parse_warnings: list[str] = Field(default_factory=list)
     quality: NativeTextQuality | None = None
     blocks: list[Block] = Field(default_factory=list)
 
@@ -251,7 +292,7 @@ class SourceDocument(StrictModel):
 
 
 class BookDocument(StrictModel):
-    schema_version: Literal["1.1"] = "1.1"
+    schema_version: Literal["1.2"] = "1.2"
     document_id: str
     metadata: BookMetadata
     source: SourceDocument
@@ -276,6 +317,8 @@ class BookDocument(StrictModel):
             for block in page.blocks:
                 if isinstance(block, ImageBlock) and block.asset_id not in self.assets:
                     raise ValueError(f"missing asset for image block {block.id}")
+                if isinstance(block, CaptionBlock) and block.for_asset_id not in self.assets:
+                    raise ValueError(f"missing asset for caption block {block.id}")
         return self
 
 

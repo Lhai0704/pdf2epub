@@ -52,7 +52,7 @@ def test_project_suffix_is_required(fixture_corpus: Path, tmp_path: Path) -> Non
         )
 
 
-def test_m1_document_is_migrated_in_memory_then_saved_as_1_1(
+def test_m1_document_is_migrated_in_memory_then_saved_as_1_2(
     fixture_corpus: Path, tmp_path: Path
 ) -> None:
     workflow = BookWorkflow()
@@ -70,11 +70,56 @@ def test_m1_document_is_migrated_in_memory_then_saved_as_1_1(
 
     loaded = workflow.load_project(root)
     assert loaded.migrated_from_schema == "1.0"
-    assert loaded.document.schema_version == "1.1"
+    assert loaded.document.schema_version == "1.2"
     assert loaded.document.pages[0].blocks[0].id == project.document.pages[0].blocks[0].id
     saved = workflow.store.save(loaded)
     assert saved.migrated_from_schema is None
-    assert json.loads(document_path.read_text(encoding="utf-8"))["schema_version"] == "1.1"
+    assert json.loads(document_path.read_text(encoding="utf-8"))["schema_version"] == "1.2"
+
+
+def test_m2_document_11_migrates_without_reparse_or_translation_loss(
+    fixture_corpus: Path, tmp_path: Path
+) -> None:
+    workflow = BookWorkflow()
+    root = tmp_path / "legacy-m2.bepub-project"
+    project = workflow.create_project(root, fixture_corpus / "digital_single_column.pdf")
+    project, _ = workflow.parse_page(project, 0)
+    original_ids = [block.id for block in project.document.pages[0].blocks]
+    document_path = root / "document.json"
+    payload = json.loads(document_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "1.1"
+    for page in payload["pages"]:
+        for field in (
+            "parser_version",
+            "parser_options",
+            "model_versions",
+            "parser_override",
+            "classification",
+            "parse_error",
+            "parse_warnings",
+        ):
+            page.pop(field, None)
+        for block in page["blocks"]:
+            block.pop("confidence", None)
+            provenance = block["provenance"]
+            for field in (
+                "provider_id",
+                "engine",
+                "device",
+                "precision",
+                "model_versions",
+                "raw_payload_schema",
+                "raw_element_ids",
+            ):
+                provenance.pop(field, None)
+    document_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = workflow.load_project(root)
+    assert loaded.migrated_from_schema == "1.1"
+    assert loaded.document.schema_version == "1.2"
+    assert [block.id for block in loaded.document.pages[0].blocks] == original_ids
+    assert loaded.document.pages[0].parser_id == "pymupdf_native"
+    assert loaded.document.pages[0].parse_status == "parsed"
 
 
 @pytest.mark.parametrize("invalid_shape", ["future-schema", "extra-field", "task-status"])

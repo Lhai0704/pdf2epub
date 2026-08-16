@@ -6,6 +6,7 @@ from pdf2epub.domain.identifiers import merged_block_id, split_block_id
 from pdf2epub.domain.models import (
     BBox,
     BookDocument,
+    CaptionBlock,
     HeadingBlock,
     Page,
     ParagraphBlock,
@@ -49,10 +50,13 @@ def _make_text_block(
         "source_text_normalized": normalized_text,
         "source_text_user": user_text,
         "style": style,
+        "confidence": template.confidence,
     }
     if heading:
         level = template.level if isinstance(template, HeadingBlock) else 1
         return HeadingBlock(**common, level=level)  # type: ignore[arg-type]
+    if isinstance(template, CaptionBlock):
+        return CaptionBlock(**common, for_asset_id=template.for_asset_id)  # type: ignore[arg-type]
     return ParagraphBlock(**common)  # type: ignore[arg-type]
 
 
@@ -66,7 +70,9 @@ class DocumentEditor:
         blocks = []
         found = False
         for block in page.blocks:
-            if block.id == block_id and isinstance(block, (ParagraphBlock, HeadingBlock)):
+            if block.id == block_id and isinstance(
+                block, (ParagraphBlock, HeadingBlock, CaptionBlock)
+            ):
                 previous_fingerprint = source_fingerprint(block.effective_text)
                 provenance = block.provenance.model_copy(update={"user_edited": True})
                 block = block.model_copy(
@@ -102,7 +108,9 @@ class DocumentEditor:
         blocks = []
         found = False
         for block in page.blocks:
-            if block.id == block_id and isinstance(block, (ParagraphBlock, HeadingBlock)):
+            if block.id == block_id and isinstance(
+                block, (ParagraphBlock, HeadingBlock, CaptionBlock)
+            ):
                 provenance = block.provenance.model_copy(update={"user_edited": True})
                 if block_type == "heading":
                     block = HeadingBlock(
@@ -114,6 +122,7 @@ class DocumentEditor:
                         source_text_normalized=block.source_text_normalized,
                         source_text_user=block.source_text_user,
                         style=block.style,
+                        confidence=block.confidence,
                         level=heading_level,
                     )
                 elif block_type == "paragraph":
@@ -126,6 +135,7 @@ class DocumentEditor:
                         source_text_normalized=block.source_text_normalized,
                         source_text_user=block.source_text_user,
                         style=block.style,
+                        confidence=block.confidence,
                         translation=block.translation
                         if isinstance(block, ParagraphBlock)
                         else None,
@@ -247,15 +257,14 @@ class DocumentEditor:
             right, (ParagraphBlock, HeadingBlock)
         ):
             raise ValueError("Only adjacent text blocks can be merged")
-        provenance = ProcessingProvenance(
-            source_sha256=left.provenance.source_sha256,
-            parser_id=left.provenance.parser_id,
-            parser_version=left.provenance.parser_version,
-            options_hash=left.provenance.options_hash,
-            source_span_ids=left.provenance.source_span_ids + right.provenance.source_span_ids,
-            raw_cache_path=left.provenance.raw_cache_path,
-            warnings=left.provenance.warnings + right.provenance.warnings,
-            user_edited=True,
+        provenance = left.provenance.model_copy(
+            update={
+                "source_span_ids": (
+                    left.provenance.source_span_ids + right.provenance.source_span_ids
+                ),
+                "warnings": left.provenance.warnings + right.provenance.warnings,
+                "user_edited": True,
+            }
         )
         merged = _make_text_block(
             left,

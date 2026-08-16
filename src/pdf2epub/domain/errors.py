@@ -17,6 +17,39 @@ class NativeTextExtractionError(Pdf2EpubError):
     """Native PDF text extraction failed."""
 
 
+class ParserUnavailableError(Pdf2EpubError):
+    """A requested parser is not registered or its optional runtime is unavailable."""
+
+
+class OcrError(Pdf2EpubError):
+    """Base error for expected OCR failures."""
+
+    def __init__(self, message: str, *, code: str = "ocr_error", fatal: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.fatal = fatal
+
+
+class OcrRuntimeUnavailableError(OcrError):
+    """The selected PaddleOCR runtime cannot be loaded."""
+
+
+class OcrModelUnavailableError(OcrError):
+    """Required OCR models are absent and download was not approved."""
+
+
+class OcrPayloadError(OcrError):
+    """The OCR provider returned an incompatible or unsafe payload."""
+
+
+class OcrCacheError(OcrError):
+    """The OCR cache could not be read or written safely."""
+
+
+class ReparseConflictError(Pdf2EpubError):
+    """A reparse would replace manual edits, derived blocks, or translations."""
+
+
 class ProjectPersistenceError(Pdf2EpubError):
     """A project could not be saved or loaded."""
 

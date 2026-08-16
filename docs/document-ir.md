@@ -1,27 +1,48 @@
-# Document IR v1.1
+# Document IR v1.2
 
-`BookDocument` is the source of truth. It stores book/source metadata, ordered pages, assets,
-translation settings, and a discriminated union of paragraph, heading, and image blocks.
+`BookDocument` is the source of truth. It stores source/book metadata, ordered pages, assets,
+translation settings, and a discriminated union of paragraph, heading, image, and caption blocks.
 
-Text blocks keep three layers:
+## Pages and routing
 
-- `source_text_raw`: adapter output, never overwritten;
-- `source_text_normalized`: deterministic line joining/hyphenation repair;
-- `source_text_user`: optional user correction used by `effective_text`.
+`PageClassification` persists `kind`, confidence, stable reason codes, recommended parser, and
+classifier version. Kinds are `digital`, `scanned`, `image_text_layer`, `suspect`, and `blank`.
+User override is `auto`, `native`, or `paddle_ppstructure_v3`; range actions write the same field to
+each selected page. `parser_id` records the adapter that produced current blocks and is null for an
+unparsed page. Parser version/options/models, parse fingerprint/error/warnings, native quality, and
+the terminal state are also persisted.
 
-Block IDs derive from source hash, page, quantized bbox, and raw span identity. Editing/type
-changes keep the ID; merge and split derive deterministic child IDs. Provenance records parser
-and option versions, source span IDs, cache location, warnings, and manual-edit state.
+Changing an override does not replace content. If it targets another parser, an existing page
+becomes `stale`. Parsing creates a candidate and atomically swaps it only after validation. A failed
+reparse preserves old blocks; an empty failed page becomes `failed`.
 
-Paragraphs optionally contain a `TranslationRecord`. A missing record means untranslated;
-terminal persisted states are `translated`, `failed`, `user_edited`, and `stale`. Provider/model,
-prompt/glossary versions, source fingerprint, cache key, request ID, usage, timestamps, and a
-sanitized error are retained. `queued` and `translating` are worker/UI states rather than crash-
-sticky project states.
+## Blocks and provenance
 
-Headings are source-only in M2. A paragraph translation can receive heading and adjacent paragraph
-context, but the response binds only to the current paragraph ID. Merge/split and heading-to-
-paragraph conversion never guess a translation.
+Text blocks keep raw, deterministic normalized, and optional user-corrected source text. Optional
+confidence is normalized to 0..1. Captions are minimal text blocks linked to an existing asset.
 
-The loader explicitly migrates `1.0` documents to `1.1` in memory. The next normal save writes
-`1.1` atomically. Unknown versions are rejected rather than silently discarding data.
+Native block IDs remain span-derived. OCR block IDs hash source/page, parser/model identity,
+normalized bbox, and provider element identity. Identical inputs and cache replay produce identical
+IDs. Edit/type changes preserve IDs; merge/split derive auditable IDs.
+
+Provenance records source/parser/options, provider/engine/device/precision, package and model
+versions/hashes, raw payload schema/element IDs, raw cache location, warnings, and manual-edit
+state. Raw parser response formats never escape the adapter.
+
+## Translation and reparse
+
+Paragraphs optionally contain a terminal `TranslationRecord`: `translated`, `failed`,
+`user_edited`, or `stale`. Queue/running states remain worker/UI-only. Provider/model,
+prompt/glossary, source fingerprint, cache key, request ID, usage, timestamps, and sanitized errors
+are retained.
+
+Any user edit, merge/split block, or translation is a reparse conflict. Confirmation performs a
+whole-page replacement, removes translations attached to replaced blocks, and does not infer block
+matches. Old raw/cache data remains available. M3 has no undo or regional reparse.
+
+## Migration
+
+The loader migrates 1.0 -> 1.1 -> 1.2 and 1.1 -> 1.2 in memory. Existing IDs, text layers, edits,
+translations, assets, and parsed content are preserved. A conservative classification with 0.60
+confidence is derived from legacy native quality. The next normal save atomically writes 1.2.
+Unknown future versions and invalid references are rejected.

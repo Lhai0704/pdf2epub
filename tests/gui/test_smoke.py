@@ -68,11 +68,51 @@ def test_hundred_page_project_is_lazy(qtbot: QtBot, fixture_corpus: Path, tmp_pa
     window.show()
     assert window.page_list.count() == 100
     qtbot.waitUntil(lambda: window.status_label.text() == "Page 1 ready", timeout=5000)
-    assert sum(page.parse_status == "parsed" for page in window.project.document.pages) <= 1
+    assert sum(page.parse_status == "parsed" for page in window.project.document.pages) == 0
     with qtbot.waitSignal(window.page_loaded, timeout=5000):
         window.page_list.setCurrentRow(50)
     assert window.current_page_index == 50
-    assert sum(page.parse_status == "parsed" for page in window.project.document.pages) <= 2
+    assert sum(page.parse_status == "parsed" for page in window.project.document.pages) == 0
+
+
+@pytest.mark.gui
+def test_parse_selected_refreshes_structure_panel(
+    qtbot: QtBot, fixture_corpus: Path, tmp_path: Path
+) -> None:
+    workflow = BookWorkflow()
+    project = workflow.create_project(
+        tmp_path / "parse-refresh.bepub-project", fixture_corpus / "digital_single_column.pdf"
+    )
+    workflow.render_page(project, 0)
+    window = MainWindow(project, workflow=workflow)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitUntil(lambda: not window._page_loading, timeout=5000)
+    assert window.block_list.count() == 0
+    with qtbot.waitSignal(window.document_changed, timeout=15000):
+        window.parse_selected_pages()
+    qtbot.waitUntil(lambda: window.block_list.count() >= 2, timeout=5000)
+    assert window._current_page().parse_status == "parsed"
+
+
+@pytest.mark.gui
+def test_gui_page_override_uses_extended_selection(
+    qtbot: QtBot, fixture_corpus: Path, tmp_path: Path
+) -> None:
+    workflow = BookWorkflow()
+    project = workflow.create_project(
+        tmp_path / "override-gui.bepub-project", fixture_corpus / "mixed.pdf"
+    )
+    window = MainWindow(project, workflow=workflow)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitUntil(lambda: not window._page_loading, timeout=5000)
+    window.page_list.item(0).setSelected(True)
+    window.page_list.item(1).setSelected(True)
+    window.override_combo.setCurrentIndex(1)
+    window.apply_page_override()
+    assert all(page.parser_override == "native" for page in window.project.document.pages)
+    assert "override=native" in window.page_list.item(0).text()
 
 
 @pytest.mark.gui

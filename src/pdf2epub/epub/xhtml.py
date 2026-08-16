@@ -5,7 +5,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from pdf2epub.domain.models import BookDocument, HeadingBlock, ImageBlock, ParagraphBlock
+from pdf2epub.domain.models import (
+    BookDocument,
+    CaptionBlock,
+    HeadingBlock,
+    ImageBlock,
+    ParagraphBlock,
+)
 
 BOOK_CSS = """body {
   font-family: serif;
@@ -18,6 +24,8 @@ p.translation { margin: 0 0 1.2em; text-indent: 1.5em; }
 .para { margin: 0; }
 img { display: block; max-width: 100%; height: auto; margin: 1em auto; }
 figure { margin: 1em 0; }
+.caption { font-size: 0.9em; font-style: italic; margin: 0.3em 0 1em; }
+.incomplete-notice { border: 0.15em solid #9a6700; padding: 1em; }
 """
 
 
@@ -89,6 +97,12 @@ def build_chapters(
                 source = html.escape(image_href(asset.relative_path), quote=True)
                 alt = html.escape(block.alt_text, quote=True)
                 body.append(f'<figure id="{block.id}"><img src="{source}" alt="{alt}" /></figure>')
+            elif isinstance(block, CaptionBlock):
+                escaped = html.escape(block.effective_text, quote=False)
+                target = html.escape(block.for_asset_id, quote=True)
+                body.append(
+                    f'<p class="caption" id="{block.id}" data-for-asset="{target}">{escaped}</p>'
+                )
     finish()
     if not chapters:
         chapters.append(
@@ -99,6 +113,32 @@ def build_chapters(
             )
         )
     return chapters
+
+
+def incomplete_notice_chapter(document: BookDocument) -> Chapter | None:
+    incomplete = [
+        page
+        for page in sorted(document.pages, key=lambda value: value.page_index)
+        if page.parse_status != "parsed" or page.parse_warnings
+    ]
+    if not incomplete:
+        return None
+    items = []
+    for page in incomplete:
+        details = [page.parse_status, *page.parse_warnings]
+        escaped = html.escape(", ".join(details), quote=False)
+        items.append(f"<li>Page {page.page_index + 1}: {escaped}</li>")
+    body = (
+        '<section class="incomplete-notice"><h1>Incomplete content notice</h1>'
+        "<p>Some source pages were not completely parsed.</p><ul>"
+        + "".join(items)
+        + "</ul></section>"
+    )
+    return Chapter(
+        title="Incomplete content notice",
+        file_name="incomplete-content.xhtml",
+        body_html=body,
+    )
 
 
 def chapter_xhtml(chapter: Chapter, language: str) -> str:

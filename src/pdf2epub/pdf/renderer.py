@@ -9,6 +9,8 @@ import pymupdf
 
 from pdf2epub.domain.errors import PageRenderError
 
+RENDERER_VERSION = "pymupdf-raster-v1"
+
 
 class PdfRenderer:
     def render_page(
@@ -21,7 +23,9 @@ class PdfRenderer:
         dpi: int = 120,
         max_pixels: int = 40_000_000,
     ) -> Path:
-        cache_key = hashlib.sha256(f"{source_sha256}:{page_index}:{dpi}".encode()).hexdigest()[:24]
+        cache_key = hashlib.sha256(
+            f"{source_sha256}:{page_index}:{dpi}:{max_pixels}:{RENDERER_VERSION}".encode()
+        ).hexdigest()[:24]
         output = cache_directory / f"page-{page_index:06d}-{cache_key}.png"
         if output.is_file():
             return output

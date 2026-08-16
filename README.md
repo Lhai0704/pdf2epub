@@ -1,11 +1,13 @@
 # pdf2epub
 
-`pdf2epub` is a local-first PySide6 workbench that converts ordinary digital PDFs into an
+`pdf2epub` is a local-first PySide6 workbench that converts digital, scanned, and mixed PDFs into an
 editable, versioned Document IR and exports a reflowable source-to-translation EPUB 3.
 
-M2 includes paragraph translation through a provider-neutral interface, deterministic fake,
-LongCat adapter, project-local cache, editable translations, and bilingual preview/export. It
-still excludes OCR, scanned/mixed PDF support, a complete EPUB reader, services, and installers.
+M3 adds provider-neutral page classification/routing, per-page Native/OCR overrides,
+PaddleOCR/PP-StructureV3, checksummed OCR cache, confidence/bbox provenance, serial batch progress
+and cancellation, protected whole-page reparse, mixed EPUB, and explicit incomplete-content
+export. It still excludes multiple OCR engines, regional reparse, a complete EPUB reader, services,
+and installers.
 
 ## Development
 
@@ -14,6 +16,16 @@ $uv = 'C:\Users\lhai0704\.local\bin\uv.exe'
 & $uv sync --locked
 & $uv run --locked pdf2epub --help
 ```
+
+OCR is optional and the CPU/GPU profiles are mutually exclusive. The RTX 4060 Windows profile was
+verified with the GPU extra:
+
+```powershell
+& $uv sync --locked --extra ocr-gpu
+```
+
+Use `--extra ocr-cpu` only as a separately installed fallback. The first OCR model download is
+never implicit: the GUI asks for confirmation, and the CLI requires `--allow-model-download`.
 
 Generate the legal fixture corpus:
 
@@ -27,7 +39,7 @@ Run all quality gates and the deterministic M1 verification:
 & $uv run --locked pytest
 & $uv run --locked ruff check .
 & $uv run --locked ruff format --check .
-& $uv run --locked mypy src tests scripts
+& $uv run --locked mypy --strict src tests
 & .\scripts\bootstrap_epubcheck.ps1
 $jar = (Resolve-Path '.tools\epubcheck-5.3.0\epubcheck.jar').Path
 & $uv run --locked python scripts\verify_m1.py `
@@ -38,6 +50,11 @@ $jar = (Resolve-Path '.tools\epubcheck-5.3.0\epubcheck.jar').Path
 & $uv run --locked python scripts\verify_m2.py `
   --pdf tmp\fixtures\digital_single_column.pdf `
   --workspace tmp\m2-verify `
+  --epubcheck-jar $jar
+
+$m3 = Join-Path $env:TEMP ('pdf2epub-m3-verify-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+& $uv run --locked python scripts\verify_m3.py `
+  --output-dir $m3 `
   --epubcheck-jar $jar
 ```
 
@@ -57,5 +74,7 @@ Real translation reads a rotated key from `LONGCAT_API_KEY`. The key must not be
 project or shell history. `scripts/smoke_longcat.py --confirm-network` sends only a generated test
 sentence and is an explicit, potentially paid manual check; pytest never calls it.
 
-The verified M0/M1 baseline and historical M2 planning brief are in
-`docs/handoffs/M2_PLAN_MODE_HANDOFF.md`.
+Real PaddleOCR is excluded from pytest. Run the explicit commands and GUI checklist in
+`docs/smoke-test.md`; the measured GPU/CPU decision is in `docs/spikes/m3-spike-d.md`.
+
+Historical milestone planning briefs remain under `docs/handoffs/`.

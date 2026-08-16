@@ -1,38 +1,80 @@
-# M2 GUI smoke test (Windows)
+# M3 GUI and real OCR smoke test (Windows)
 
-## Preparation
+Automated tests use fake OCR. They do not prove that Paddle, the downloaded models, GPU, or visual
+overlay work on the target machine. The following checks are explicit because the first OCR run
+downloads models and real translation can send text remotely.
+
+## Preparation and framework check
 
 ```powershell
 Set-Location D:\Projects\pdf2epub
 $uv = 'C:\Users\lhai0704\.local\bin\uv.exe'
+$env:PADDLE_PDX_CACHE_HOME = Join-Path $env:LOCALAPPDATA 'pdf2epub\models\paddlex'
+& $uv sync --locked --extra ocr-gpu
+& $uv run --locked --extra ocr-gpu python scripts\smoke_paddleocr.py `
+  --framework-check --device gpu:0 --no-model-download
+```
+
+The framework check must report CUDA enabled, one visible RTX 4060, `active_device` `gpu:0`, and
+the expected matrix result. It does not download models. A clean GPU-extra installation downloads
+about 1.3 GiB of CUDA/cuDNN runtime wheels; this is separate from the OCR model download below.
+
+## Explicit real OCR and cache smoke
+
+The first command downloads the three official models if they are absent. Review the cache path
+and free disk space before confirming it.
+
+```powershell
+$first = Join-Path $env:TEMP ('pdf2epub-m3-real-ocr-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+& $uv run --locked --extra ocr-gpu python scripts\smoke_paddleocr.py `
+  --device gpu:0 --confirm-model-download --benchmark-cpu --output-dir $first
+
+$repeat = Join-Path $env:TEMP ('pdf2epub-m3-real-ocr-repeat-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+& $uv run --locked --extra ocr-gpu python scripts\smoke_paddleocr.py `
+  --device gpu:0 --require-existing-models --require-cache-hit --output-dir $repeat
+```
+
+Both runs must produce normalized blocks without logging their text. The repeat must report a
+project cache hit and no missing models. The CPU benchmark note documents the bounded Spike D
+result; the full high-quality CPU inference is not repeated because it exceeded 90 seconds and 20
+GB RAM.
+
+## GUI preparation
+
+```powershell
 & $uv run --locked python scripts\make_fixtures.py --output tmp\fixtures
-& .\scripts\bootstrap_epubcheck.ps1
+.\scripts\bootstrap_epubcheck.ps1
 $jar = (Resolve-Path '.tools\epubcheck-5.3.0\epubcheck.jar').Path
-& $uv run --locked pdf2epub gui `
-  --source tmp\fixtures\digital_single_column.pdf `
-  --project tmp\manual-smoke.bepub-project `
+& $uv run --locked --extra ocr-gpu pdf2epub gui `
+  --source tmp\fixtures\mixed.pdf `
+  --project tmp\manual-m3-smoke.bepub-project `
   --epubcheck-jar $jar
 ```
 
-## Checklist
+## GUI checklist
 
-1. Confirm Pages, PDF Page, Structure, EPUB Preview, and Logs are visible.
-2. Select a text block in either the overlay or block list; confirm the other view follows.
-3. Zoom the PDF page, edit a paragraph, and click **Apply Edit**.
-4. Merge two adjacent text blocks, then split a block at an interior cursor position.
-5. Confirm the EPUB Preview updates and raw source is still present after save/reopen.
-6. Export into the project's `exports` directory and confirm `EPUB validation: PASS`.
-7. Close the app, reopen with `pdf2epub gui --project tmp\manual-smoke.bepub-project`, and
-   confirm the edits remain.
-8. In Translation, set source `en` and target `zh-CN`; select several paragraphs.
-9. Confirm the LongCat privacy prompt lists the context sent remotely, then translate with a
-   rotated key supplied only through `LONGCAT_API_KEY`.
-10. Confirm progress, status/provider/model, retry, and Cancel remain responsive. A cancelled batch
-    must retain already completed translations after reopen.
-11. Edit one translation and confirm it becomes `user_edited`. Edit its source and confirm only
-    that translation becomes `stale`.
-12. Regenerate preview and confirm source then translation ordering. Export and confirm EPUBCheck
-    PASS; if content is incomplete, confirm the UI labels it incomplete rather than fully complete.
+1. Confirm opening digital and scanned pages renders previews but does not parse them.
+2. Confirm Page List shows classification, recommendation, override, actual parser, status, and
+   warning count; inspect reason/error tooltips.
+3. Select one or multiple pages and apply Auto, Force Native, and Force OCR. A changed parser for
+   existing content must mark the page stale without replacing blocks.
+4. Parse the mixed fixture. The digital page must use Native and the scanned page must use Paddle.
+5. Confirm progress stages update, the UI stays responsive, and Cancel stops after the current page.
+6. Confirm OCR overlay tooltips show block type/confidence and low-confidence boxes are distinct.
+   Selecting a box and block-list row must remain bidirectional.
+7. Retry a failed page and explicitly Force Native if desired. No parser fallback may occur without
+   that action. If GPU OOM is simulated/encountered, CPU retry requires confirmation.
+8. Edit an OCR block, create a merge/split or translation, then Reparse. Confirm the conflict dialog
+   reports affected counts. Cancel preserves everything; confirmed success replaces the page and
+   does not inherit translations; failure preserves old content.
+9. Disconnect the network after models exist and confirm OCR initializes from the local model
+   cache. Missing models while offline must produce a clear error, not an implicit download loop.
+10. Export with an unparsed/stale/failed/warning page. Cancel the confirmation and verify no file is
+    generated; confirm it and verify a visible `Incomplete content notice` appears in the EPUB.
+11. Export a complete mixed project and confirm it has no incomplete notice.
+12. Run EPUBCheck on both EPUBs and require 0 fatals, 0 errors, and 0 warnings.
+13. Close/reopen the project and confirm IR 1.2 page states, overrides, errors, edits, translations,
+    assets, and OCR provenance remain intact.
 
-The automated offscreen counterpart is `tests/gui/test_smoke.py`; it uses `FakeTranslator`, makes
-no paid network calls, and does not replace this visual interaction check.
+The offscreen counterpart is `tests/gui/test_smoke.py`. Paid LongCat smoke remains separately
+gated by `LONGCAT_API_KEY` and `scripts/smoke_longcat.py --confirm-network`.

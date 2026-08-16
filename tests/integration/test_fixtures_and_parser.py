@@ -30,6 +30,21 @@ def test_fixture_corpus_shape(fixture_corpus: Path) -> None:
     )
 
 
+def test_m3_fixture_classification_boundaries(fixture_corpus: Path) -> None:
+    analyzer = PdfAnalyzer()
+    expected = {
+        "scanned_only.pdf": ("scanned", "paddle_ppstructure_v3"),
+        "image_hidden_text_layer.pdf": ("image_text_layer", "native"),
+        "suspect_native_layer.pdf": ("suspect", "paddle_ppstructure_v3"),
+        "blank.pdf": ("blank", "native"),
+        "rotated_scanned.pdf": ("scanned", "paddle_ppstructure_v3"),
+        "large_boundary.pdf": ("digital", "native"),
+    }
+    for name, classification in expected.items():
+        page = analyzer.inspect_document(fixture_corpus / name).pages[0]
+        assert (page.classification.kind, page.classification.recommended_parser) == classification
+
+
 def test_single_column_parser_golden_and_cache(fixture_corpus: Path, tmp_path: Path) -> None:
     workflow = BookWorkflow()
     project = workflow.create_project(

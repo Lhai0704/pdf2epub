@@ -29,6 +29,28 @@ class FunctionWorker(QRunnable):
             self.signals.finished.emit(result)
 
 
+class ProgressWorker(QRunnable):
+    def __init__(
+        self,
+        function: Callable[[Callable[[int, int, object], None]], Any],
+    ) -> None:
+        super().__init__()
+        self.function = function
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self) -> None:
+        def progress(current: int, total: int, item: object) -> None:
+            self.signals.progress.emit(current, total, item)
+
+        try:
+            result = self.function(progress)
+        except Exception as exc:
+            self.signals.error.emit(f"{type(exc).__name__}: {exc}")
+        else:
+            self.signals.finished.emit(result)
+
+
 class AsyncProgressWorker(QRunnable):
     def __init__(
         self,

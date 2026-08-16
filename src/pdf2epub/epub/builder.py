@@ -12,7 +12,13 @@ from pydantic import BaseModel, ConfigDict
 
 from pdf2epub.domain.errors import EpubBuildError
 from pdf2epub.domain.models import BookDocument, HeadingBlock, ParagraphBlock
-from pdf2epub.epub.xhtml import BOOK_CSS, Chapter, build_chapters, chapter_xhtml
+from pdf2epub.epub.xhtml import (
+    BOOK_CSS,
+    Chapter,
+    build_chapters,
+    chapter_xhtml,
+    incomplete_notice_chapter,
+)
 
 
 class EpubBuildResult(BaseModel):
@@ -25,6 +31,7 @@ class EpubBuildResult(BaseModel):
 class EpubBuildOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     mode: Literal["original", "source_translation"] = "original"
+    include_incomplete_notice: bool = False
 
 
 def _container_xml() -> str:
@@ -121,6 +128,14 @@ class EpubBuilder:
     ) -> EpubBuildResult:
         options = options or EpubBuildOptions()
         chapters = build_chapters(document, mode=options.mode)
+        notice = incomplete_notice_chapter(document)
+        if notice is not None and not options.include_incomplete_notice:
+            raise EpubBuildError(
+                "Document contains unparsed, stale, failed, or warning pages; "
+                "explicit incomplete export confirmation is required"
+            )
+        if notice is not None:
+            chapters.insert(0, notice)
         warnings = self._content_warnings(document, chapters, options)
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
@@ -176,6 +191,8 @@ class EpubBuilder:
         document: BookDocument, chapters: list[Chapter], options: EpubBuildOptions
     ) -> list[str]:
         warnings: list[str] = []
+        if incomplete_notice_chapter(document) is not None:
+            warnings.append("EPUB contains an incomplete content notice")
         ids = [
             block.id
             for page in document.pages

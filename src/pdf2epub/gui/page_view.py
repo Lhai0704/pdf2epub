@@ -38,6 +38,17 @@ class PdfPageView(QGraphicsView):
             rect.setPen(pen)
             rect.setBrush(brush)
             rect.setData(0, block.id)
+            confidence = (
+                f"; confidence={block.confidence:.2f}" if block.confidence is not None else ""
+            )
+            warning = (
+                "; low confidence"
+                if block.confidence is not None and block.confidence < 0.5
+                else ""
+            )
+            rect.setToolTip(f"{block.type}{confidence}{warning}")
+            if block.confidence is not None and block.confidence < 0.5:
+                rect.setPen(QPen(QColor(210, 130, 20, 220), 2))
             rect.setZValue(2)
             scene.addItem(rect)
             self._rectangles[block.id] = rect

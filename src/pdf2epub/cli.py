@@ -8,9 +8,10 @@ from pathlib import Path
 
 from pdf2epub.application.workflow import BookWorkflow
 from pdf2epub.domain.errors import Pdf2EpubError
-from pdf2epub.epub.builder import EpubBuilder
+from pdf2epub.epub.builder import EpubBuilder, EpubBuildOptions
 from pdf2epub.epub.validator import EpubValidator
 from pdf2epub.fixtures import generate_fixture_corpus
+from pdf2epub.parsers.base import OcrParseOptions
 from pdf2epub.pdf.analyzer import PdfAnalyzer
 
 
@@ -41,11 +42,19 @@ def _parser() -> argparse.ArgumentParser:
     parse = commands.add_parser("parse", help="Parse one page or all pages into Document IR")
     parse.add_argument("project", type=Path)
     parse.add_argument("--page", type=int, help="One-based page number; omit for all pages")
+    parse.add_argument(
+        "--parser", choices=["auto", "native", "paddle_ppstructure_v3"], default="auto"
+    )
+    parse.add_argument("--device", choices=["gpu:0", "cpu"], default="gpu:0")
+    parse.add_argument("--allow-model-download", action="store_true")
+    parse.add_argument("--reparse", action="store_true")
+    parse.add_argument("--confirm-reparse-conflicts", action="store_true")
 
     export = commands.add_parser("export", help="Build and validate a monolingual EPUB")
     export.add_argument("project", type=Path)
     export.add_argument("--output", type=Path, required=True)
     export.add_argument("--epubcheck-jar", type=Path)
+    export.add_argument("--allow-incomplete", action="store_true")
 
     validate = commands.add_parser("validate", help="Run EPUBCheck")
     validate.add_argument("epub", type=Path)
@@ -91,19 +100,50 @@ def _dispatch(arguments: argparse.Namespace) -> int:
         return 0
     if arguments.command == "parse":
         project = workflow.load_project(arguments.project)
+        indexes = (
+            [arguments.page - 1]
+            if arguments.page is not None
+            else [page.page_index for page in project.document.pages]
+        )
+        if arguments.page is not None and (
+            arguments.page < 1 or arguments.page > len(project.document.pages)
+        ):
+            raise ValueError("Page number is outside the project")
+        if arguments.parser != "auto":
+            project = workflow.set_page_override(project, indexes, arguments.parser)
+        options = OcrParseOptions(
+            device=arguments.device,
+            allow_model_download=arguments.allow_model_download,
+        )
         if arguments.page is not None:
-            if arguments.page < 1 or arguments.page > len(project.document.pages):
-                raise ValueError("Page number is outside the project")
-            project, cache_hit = workflow.parse_page(project, arguments.page - 1)
+            project, cache_hit = workflow.parse_page(
+                project,
+                arguments.page - 1,
+                options=options,
+                reparse=arguments.reparse,
+                confirm_conflicts=arguments.confirm_reparse_conflicts,
+            )
             print(json.dumps({"page": arguments.page, "cache_hit": cache_hit}))
         else:
-            _, parsed_count = workflow.parse_all(project)
-            print(json.dumps({"parsed_pages": parsed_count}))
+            _, summary = workflow.parse_pages(
+                project,
+                indexes,
+                options=options,
+                reparse=arguments.reparse,
+                confirm_conflicts=arguments.confirm_reparse_conflicts,
+            )
+            print(
+                json.dumps({"parsed_pages": summary.parsed_count, "failed": summary.failed_pages})
+            )
         return 0
     if arguments.command == "export":
         project = workflow.load_project(arguments.project)
-        project, _ = workflow.parse_all(project)
-        build = EpubBuilder().build(project.document, Path(project.root), arguments.output)
+        build = EpubBuilder().build(
+            project.document,
+            Path(project.root),
+            arguments.output,
+            options=EpubBuildOptions(include_incomplete_notice=arguments.allow_incomplete),
+        )
         report = EpubValidator(arguments.epubcheck_jar).validate(arguments.output)
         print(
             json.dumps(

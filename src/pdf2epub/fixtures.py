@@ -46,6 +46,11 @@ def _save(document: pymupdf.Document, path: Path, title: str) -> None:
 
 
 def make_single_column(path: Path) -> None:
+    document = _single_column_document()
+    _save(document, path, "Digital Single Column")
+
+
+def _single_column_document() -> pymupdf.Document:
     document = pymupdf.open()
     page = document.new_page(width=612, height=792)
     page.insert_text((72, 72), "Chapter 1", fontsize=22, fontname="hebo")
@@ -66,7 +71,85 @@ def make_single_column(path: Path) -> None:
     page.insert_text(
         (72, 285), "A second paragraph gives the exporter enough content to reflow.", fontsize=11
     )
-    _save(document, path, "Digital Single Column")
+    return document
+
+
+def _rasterized_single_page() -> tuple[bytes, float, float]:
+    source = _single_column_document()
+    try:
+        page = source[0]
+        pixmap = page.get_pixmap(dpi=200, alpha=False)
+        return pixmap.tobytes("png"), page.rect.width, page.rect.height
+    finally:
+        source.close()
+
+
+def make_scanned_only(path: Path) -> None:
+    image, width, height = _rasterized_single_page()
+    document = pymupdf.open()
+    page = document.new_page(width=width, height=height)
+    page.insert_image(page.rect, stream=image)
+    _save(document, path, "Scanned Only")
+
+
+def make_mixed(path: Path) -> None:
+    digital = _single_column_document()
+    scanned_image, width, height = _rasterized_single_page()
+    scanned = pymupdf.open()
+    scanned_page = scanned.new_page(width=width, height=height)
+    scanned_page.insert_image(scanned_page.rect, stream=scanned_image)
+    document = pymupdf.open()
+    document.insert_pdf(digital)
+    document.insert_pdf(scanned)
+    digital.close()
+    scanned.close()
+    _save(document, path, "Mixed Digital and Scanned")
+
+
+def make_hidden_text_layer(path: Path) -> None:
+    image, width, height = _rasterized_single_page()
+    document = pymupdf.open()
+    page = document.new_page(width=width, height=height)
+    page.insert_image(page.rect, stream=image)
+    page.insert_text(
+        (72, 72),
+        "Hidden accessible text layer with enough characters to remain usable for native parsing "
+        "without invoking OCR.",
+        fontsize=11,
+        render_mode=3,
+    )
+    _save(document, path, "Image With Hidden Text Layer")
+
+
+def make_suspect(path: Path) -> None:
+    image, _width, _height = _rasterized_single_page()
+    document = pymupdf.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_image(pymupdf.Rect(0, 0, 612, 500), stream=image, keep_proportion=False)
+    page.insert_text((72, 550), "Tiny text", fontsize=8)
+    _save(document, path, "Suspect Native Layer")
+
+
+def make_blank(path: Path) -> None:
+    document = pymupdf.open()
+    document.new_page(width=612, height=792)
+    _save(document, path, "Blank Page")
+
+
+def make_rotated_scanned(path: Path) -> None:
+    image, width, height = _rasterized_single_page()
+    document = pymupdf.open()
+    page = document.new_page(width=width, height=height)
+    page.insert_image(page.rect, stream=image)
+    page.set_rotation(90)
+    _save(document, path, "Rotated Scanned Page")
+
+
+def make_large_boundary(path: Path) -> None:
+    document = pymupdf.open()
+    page = document.new_page(width=1550, height=2000)
+    page.insert_text((150, 180), "Large generated page boundary fixture", fontsize=28)
+    _save(document, path, "Large Boundary Page")
 
 
 def make_two_column(path: Path) -> None:
@@ -151,6 +234,13 @@ def generate_fixture_corpus(output: Path) -> list[Path]:
         "digital_image_caption.pdf": make_image_caption,
         "digital_structure_edges.pdf": make_structure_edges,
         "digital_100_pages.pdf": make_hundred_pages,
+        "scanned_only.pdf": make_scanned_only,
+        "mixed.pdf": make_mixed,
+        "image_hidden_text_layer.pdf": make_hidden_text_layer,
+        "suspect_native_layer.pdf": make_suspect,
+        "blank.pdf": make_blank,
+        "rotated_scanned.pdf": make_rotated_scanned,
+        "large_boundary.pdf": make_large_boundary,
     }
     generated = []
     for name, maker in makers.items():

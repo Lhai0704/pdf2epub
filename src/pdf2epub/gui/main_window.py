@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool, Signal
+from PySide6.QtCore import Qt, QThreadPool, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -31,9 +32,11 @@ from PySide6.QtWidgets import (
 )
 
 from pdf2epub.application.editing import DocumentEditor
+from pdf2epub.application.parsing import BatchParseSummary, ParseProgress, reparse_conflict
 from pdf2epub.application.workflow import BookWorkflow
 from pdf2epub.domain.models import (
     BookDocument,
+    CaptionBlock,
     HeadingBlock,
     ImageBlock,
     LoadedProject,
@@ -45,7 +48,15 @@ from pdf2epub.epub.validator import EpubValidator
 from pdf2epub.epub.xhtml import preview_html
 from pdf2epub.gui.page_view import PdfPageView
 from pdf2epub.gui.translation_view import TranslationView
-from pdf2epub.gui.workers import AsyncProgressWorker, FunctionWorker
+from pdf2epub.gui.workers import AsyncProgressWorker, FunctionWorker, ProgressWorker
+from pdf2epub.parsers.base import OcrParseOptions, ParseOptions
+from pdf2epub.parsers.paddle_structure import (
+    DETECTION_MODEL,
+    LAYOUT_MODEL,
+    RECOGNITION_MODELS,
+    default_model_cache_root,
+)
+from pdf2epub.parsers.registry import OCR_PARSER_ID, ParserRouter
 from pdf2epub.translation.base import BatchItemResult, BatchTranslationResult, Translator
 from pdf2epub.translation.providers.longcat import LONGCAT_ENDPOINT, LongCatProvider
 from pdf2epub.translation.service import TranslationService
@@ -63,6 +74,12 @@ class ExportResult:
     project: LoadedProject
     passed: bool
     message: str
+
+
+@dataclass(frozen=True, slots=True)
+class PageBatchResult:
+    project: LoadedProject
+    summary: BatchParseSummary
 
 
 class MainWindow(QMainWindow):
@@ -92,9 +109,10 @@ class MainWindow(QMainWindow):
         self.cancel_event = threading.Event()
         self.current_page_index = 0
         self.current_block_id: str | None = None
+        self._current_image_path: str | None = None
         self._page_loading = False
         self._pending_page_index: int | None = None
-        self._active_workers: set[FunctionWorker | AsyncProgressWorker] = set()
+        self._active_workers: set[FunctionWorker | ProgressWorker | AsyncProgressWorker] = set()
         self.setWindowTitle(f"pdf2epub — {project.document.metadata.title}")
         self.resize(1280, 800)
         self._build_ui()
@@ -107,9 +125,33 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         root_layout = QVBoxLayout(central)
+        parser_row = QHBoxLayout()
+        self.override_combo = QComboBox()
+        self.override_combo.addItem("Auto", "auto")
+        self.override_combo.addItem("Force Native", "native")
+        self.override_combo.addItem("Force OCR", "paddle_ppstructure_v3")
+        self.override_button = QPushButton("Apply Override")
+        self.override_button.clicked.connect(self.apply_page_override)
+        self.analyze_button = QPushButton("Analyze")
+        self.analyze_button.clicked.connect(self.analyze_document)
+        self.parse_button = QPushButton("Parse Selected")
+        self.parse_button.clicked.connect(self.parse_selected_pages)
+        self.reparse_button = QPushButton("Reparse")
+        self.reparse_button.clicked.connect(self.reparse_selected_pages)
+        self.retry_button = QPushButton("Retry Failed")
+        self.retry_button.clicked.connect(self.retry_failed_pages)
+        parser_row.addWidget(self.override_combo)
+        parser_row.addWidget(self.override_button)
+        parser_row.addWidget(self.analyze_button)
+        parser_row.addWidget(self.parse_button)
+        parser_row.addWidget(self.reparse_button)
+        parser_row.addWidget(self.retry_button)
+        parser_row.addStretch(1)
+        root_layout.addLayout(parser_row)
         splitter = QSplitter()
         self.page_list = QListWidget()
         self.page_list.setObjectName("pageList")
+        self.page_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.page_list.currentRowChanged.connect(self.load_page)
         splitter.addWidget(self.page_list)
 
@@ -190,15 +232,247 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         return widget
 
+    def _selected_page_indexes(self) -> list[int]:
+        selected = [
+            int(item.data(Qt.ItemDataRole.UserRole)) for item in self.page_list.selectedItems()
+        ]
+        if selected:
+            return selected
+        return [self.current_page_index] if self.project.document.pages else []
+
+    def analyze_document(self) -> None:
+        if self._active_workers:
+            return
+        self._set_parsing_busy(True, "Analyzing page signals…")
+
+        def task() -> LoadedProject:
+            return self.workflow.analyze_project(self.project)
+
+        self._start_worker(task, self._analysis_ready)
+
+    def _analysis_ready(self, result: object) -> None:
+        if not isinstance(result, LoadedProject):
+            raise TypeError("Unexpected analysis result")
+        self.project = result
+        self._set_parsing_busy(False, "Page classification updated")
+        self._refresh_page_list()
+        self.document_changed.emit()
+
+    def apply_page_override(self) -> None:
+        indexes = self._selected_page_indexes()
+        if not indexes:
+            return
+        override = str(self.override_combo.currentData())
+        if override not in {"auto", "native", "paddle_ppstructure_v3"}:
+            raise ValueError(f"Unexpected parser override: {override}")
+        self.project = self.workflow.set_page_override(
+            self.project,
+            indexes,
+            override,  # type: ignore[arg-type]
+        )
+        self._refresh_page_list()
+        self.status_label.setText(f"Updated parser override for {len(indexes)} page(s)")
+        self.document_changed.emit()
+
+    def parse_selected_pages(self) -> None:
+        self._start_page_parse(self._selected_page_indexes(), reparse=False)
+
+    def reparse_selected_pages(self) -> None:
+        self._start_page_parse(self._selected_page_indexes(), reparse=True)
+
+    def retry_failed_pages(self) -> None:
+        indexes = [
+            page.page_index
+            for page in self.project.document.pages
+            if page.parse_status == "failed" or page.parse_error is not None
+        ]
+        self._start_page_parse(indexes, reparse=False)
+
+    def _parse_options_for(self, indexes: list[int]) -> ParseOptions | None:
+        pages = {
+            page.page_index: page
+            for page in self.project.document.pages
+            if page.page_index in indexes
+        }
+        needs_ocr = any(
+            ParserRouter.parser_id_for_page(page) == OCR_PARSER_ID for page in pages.values()
+        )
+        if not needs_ocr:
+            return ParseOptions()
+        language = self.project.document.metadata.language.casefold()
+        recognition = (
+            RECOGNITION_MODELS["zh"] if language.startswith("zh") else RECOGNITION_MODELS["en"]
+        )
+        root = default_model_cache_root()
+        models = [LAYOUT_MODEL, DETECTION_MODEL, recognition]
+        missing = [model for model in models if not (root / "official_models" / model).is_dir()]
+        allow_download = False
+        if missing:
+            answer = QMessageBox.question(
+                self,
+                "Download local OCR models?",
+                "The selected pages require PaddleOCR models. The first run will download "
+                f"approximately 218 MB of model weights to {root}. PDF content remains local. "
+                f"Missing models: {', '.join(missing)}. Continue?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+            allow_download = True
+        return OcrParseOptions(device="gpu:0", allow_model_download=allow_download)
+
+    def _start_page_parse(
+        self,
+        indexes: list[int],
+        *,
+        reparse: bool,
+        options: ParseOptions | None = None,
+        conflicts_confirmed: bool = False,
+    ) -> None:
+        if not indexes or self._active_workers:
+            return
+        if reparse and not conflicts_confirmed:
+            conflicts = [
+                reparse_conflict(page)
+                for page in self.project.document.pages
+                if page.page_index in indexes
+            ]
+            edited = sum(item.user_edited_blocks for item in conflicts)
+            derived = sum(item.derived_blocks for item in conflicts)
+            translated = sum(item.translations for item in conflicts)
+            if edited or derived or translated:
+                answer = QMessageBox.question(
+                    self,
+                    "Replace parsed page content?",
+                    f"Reparse will replace {edited} edited blocks, {derived} merged/split blocks, "
+                    f"and remove {translated} active translations. Old raw/cache data is retained, "
+                    "but translations are not inherited. Continue?",
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                conflicts_confirmed = True
+        options = options or self._parse_options_for(indexes)
+        if options is None:
+            return
+        self.cancel_event.clear()
+        self._set_parsing_busy(True, f"Parsing {len(indexes)} selected page(s)…")
+        batch_project = self.project
+
+        def task(report: Callable[[int, int, object], None]) -> PageBatchResult:
+            project, summary = self.workflow.parse_pages(
+                batch_project,
+                indexes,
+                options=options,
+                progress=lambda event: report(event.current, event.total, event),
+                cancelled=self.cancel_event.is_set,
+                reparse=reparse,
+                confirm_conflicts=conflicts_confirmed,
+            )
+            return PageBatchResult(project, summary)
+
+        worker = ProgressWorker(task)
+        self._active_workers.add(worker)
+        worker.signals.progress.connect(self._page_parse_progress)
+
+        def finished(result: object) -> None:
+            self._active_workers.discard(worker)
+            self._page_parse_ready(result)
+
+        def failed(message: str) -> None:
+            self._active_workers.discard(worker)
+            self._operation_failed(message)
+
+        worker.signals.finished.connect(finished)
+        worker.signals.error.connect(failed)
+        self.thread_pool.start(worker)
+
+    def _page_parse_progress(self, current: int, total: int, item: object) -> None:
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(max(current - 1, 0))
+        if isinstance(item, ParseProgress):
+            self.status_label.setText(
+                f"Page {item.page_index + 1}: {item.stage} ({current}/{total})"
+            )
+
+    def _page_parse_ready(self, result: object) -> None:
+        if not isinstance(result, PageBatchResult):
+            raise TypeError("Unexpected page parse result")
+        self.project = result.project
+        summary = result.summary
+        self._set_parsing_busy(False, "Page parsing finished")
+        self._refresh_page_list()
+        self.translation_view.refresh(self.project.document)
+        self._refresh_preview()
+        self._reload_current_page_view()
+        self.document_changed.emit()
+        message = (
+            f"Parsing finished: {summary.parsed_count} parsed, {summary.cache_hits} cache hits, "
+            f"{len(summary.failed_pages)} failed"
+        )
+        if summary.cancelled:
+            message += "; cancelled after the current page"
+        self.status_label.setText(message)
+        self.logs.appendPlainText(message)
+        oom_pages = [
+            page.page_index
+            for page in self.project.document.pages
+            if page.page_index in summary.failed_pages
+            and page.parse_error is not None
+            and page.parse_error.code == "ocr_gpu_oom"
+        ]
+        if oom_pages:
+            answer = QMessageBox.question(
+                self,
+                "GPU memory exhausted",
+                "GPU OCR ran out of memory. Retry the affected pages on CPU? "
+                "This can be much slower.",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._start_page_parse(
+                    oom_pages,
+                    reparse=False,
+                    options=OcrParseOptions(device="cpu"),
+                )
+
+    def _set_parsing_busy(self, busy: bool, message: str) -> None:
+        self.cancel_button.setEnabled(busy)
+        self.override_button.setEnabled(not busy)
+        self.analyze_button.setEnabled(not busy)
+        self.parse_button.setEnabled(not busy)
+        self.reparse_button.setEnabled(not busy)
+        self.retry_button.setEnabled(not busy)
+        self.override_combo.setEnabled(not busy)
+        self.structure_widget.setEnabled(not busy)
+        self.translation_view.set_busy(busy)
+        self.save_button.setEnabled(not busy)
+        self.export_button.setEnabled(not busy)
+        self.page_list.setEnabled(not busy)
+        if busy:
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setRange(0, 1)
+            self.progress.setValue(1)
+        self.status_label.setText(message)
+
     def _refresh_page_list(self) -> None:
         selected = self.page_list.currentRow()
         self.page_list.blockSignals(True)
         self.page_list.clear()
         for page in self.project.document.pages:
-            quality = page.quality.status if page.quality else "unknown"
-            status = "Native" if quality == "usable" else "Suspect/Unsupported"
-            marker = "✓" if page.parse_status == "parsed" else "…"
-            item = QListWidgetItem(f"{page.page_index + 1:4d}  {status} {marker}")
+            classification = page.classification
+            kind = classification.kind if classification else "unknown"
+            recommended = classification.recommended_parser if classification else "native"
+            actual = page.parser_id or "none"
+            warning_marker = f" warnings={len(page.parse_warnings)}" if page.parse_warnings else ""
+            item = QListWidgetItem(
+                f"{page.page_index + 1:4d} {kind} rec={recommended} "
+                f"override={page.parser_override} actual={actual} "
+                f"status={page.parse_status}{warning_marker}"
+            )
+            details = list(classification.reasons if classification else [])
+            if page.parse_error is not None:
+                details.append(f"{page.parse_error.code}: {page.parse_error.message}")
+            details.extend(page.parse_warnings)
+            item.setToolTip("\n".join(details))
             item.setData(256, page.page_index)
             self.page_list.addItem(item)
         if 0 <= selected < self.page_list.count():
@@ -222,9 +496,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)
 
         def task() -> PageLoadResult:
-            project, _ = self.workflow.parse_page(self.project, page_index)
-            image = self.workflow.render_page(project, page_index)
-            return PageLoadResult(project, str(image), page_index)
+            image = self.workflow.render_page(self.project, page_index)
+            return PageLoadResult(self.project, str(image), page_index)
 
         self._start_worker(task, self._page_ready)
 
@@ -243,6 +516,7 @@ class MainWindow(QMainWindow):
         page = next(
             page for page in result.project.document.pages if page.page_index == result.page_index
         )
+        self._current_image_path = result.image_path
         self.page_view.show_page(result.image_path, page)
         self._refresh_blocks()
         self._refresh_page_list()
@@ -253,6 +527,13 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Page {result.page_index + 1} ready")
         self.page_loaded.emit(result.page_index)
 
+    def _reload_current_page_view(self) -> None:
+        if not self.project.document.pages:
+            return
+        if self._current_image_path is not None:
+            self.page_view.show_page(self._current_image_path, self._current_page())
+        self._refresh_blocks()
+
     def _refresh_blocks(self) -> None:
         page = self._current_page()
         self.block_list.blockSignals(True)
@@ -261,7 +542,8 @@ class MainWindow(QMainWindow):
             if isinstance(block, ImageBlock):
                 label = f"[image] {block.asset_id}"
             else:
-                label = f"[{block.type}] {block.effective_text[:70]}"
+                confidence = f" {block.confidence:.2f}" if block.confidence is not None else ""
+                label = f"[{block.type}{confidence}] {block.effective_text[:70]}"
             item = QListWidgetItem(label)
             item.setData(256, block.id)
             self.block_list.addItem(item)
@@ -286,7 +568,9 @@ class MainWindow(QMainWindow):
             return
         self.text_editor.setEnabled(True)
         self.text_editor.setPlainText(block.effective_text)
-        self.type_combo.setCurrentText(block.type)
+        self.type_combo.setCurrentText(
+            block.type if not isinstance(block, CaptionBlock) else "paragraph"
+        )
         self.heading_level.setValue(block.level if isinstance(block, HeadingBlock) else 1)
 
     def _select_block_by_id(self, block_id: str) -> None:
@@ -406,6 +690,12 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(True)
         self.translation_view.set_busy(True)
         self.structure_widget.setEnabled(False)
+        self.override_button.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.parse_button.setEnabled(False)
+        self.reparse_button.setEnabled(False)
+        self.retry_button.setEnabled(False)
+        self.override_combo.setEnabled(False)
         self.save_button.setEnabled(False)
         self.export_button.setEnabled(False)
         self.page_list.setEnabled(False)
@@ -467,6 +757,12 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.translation_view.set_busy(False)
         self.structure_widget.setEnabled(True)
+        self.override_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self.parse_button.setEnabled(True)
+        self.reparse_button.setEnabled(True)
+        self.retry_button.setEnabled(True)
+        self.override_combo.setEnabled(True)
         self.save_button.setEnabled(True)
         self.export_button.setEnabled(True)
         self.page_list.setEnabled(True)
@@ -509,31 +805,36 @@ class MainWindow(QMainWindow):
             for page in self.project.document.pages
             for block in page.blocks
         )
-        unparsed_pages = sum(page.parse_status != "parsed" for page in self.project.document.pages)
-        if (incomplete or unparsed_pages) and self.confirm_incomplete_export:
+        incomplete_pages = [
+            page
+            for page in self.project.document.pages
+            if page.parse_status != "parsed" or page.parse_warnings
+        ]
+        if (incomplete or incomplete_pages) and self.confirm_incomplete_export:
             answer = QMessageBox.question(
                 self,
                 "Incomplete bilingual content",
                 f"{incomplete} paragraphs do not have a valid translation. "
-                f"{unparsed_pages} pages are not parsed and may add untranslated paragraphs. "
+                f"{len(incomplete_pages)} pages are unparsed, stale, failed, or have warnings. "
                 "Export a valid but incomplete bilingual EPUB anyway?",
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self.cancel_event.clear()
-        self.cancel_button.setEnabled(True)
-        self.progress.setRange(0, 0)
-        self.status_label.setText("Parsing remaining pages and exporting…")
+        self._set_parsing_busy(True, "Exporting current project content…")
 
         def task() -> ExportResult:
-            project, _ = self.workflow.parse_all(self.project, cancelled=self.cancel_event.is_set)
+            project = self.project
             if self.cancel_event.is_set():
                 return ExportResult(project, False, "Export cancelled")
             build = EpubBuilder().build(
                 project.document,
                 Path(project.root),
                 output,
-                options=EpubBuildOptions(mode="source_translation"),
+                options=EpubBuildOptions(
+                    mode="source_translation",
+                    include_incomplete_notice=bool(incomplete_pages),
+                ),
             )
             report = EpubValidator(self.epubcheck_jar).validate(output)
             message = (
@@ -550,9 +851,7 @@ class MainWindow(QMainWindow):
         if not isinstance(result, ExportResult):
             raise TypeError("Unexpected export worker result")
         self.project = result.project
-        self.cancel_button.setEnabled(False)
-        self.progress.setRange(0, 1)
-        self.progress.setValue(1)
+        self._set_parsing_busy(False, result.message)
         self._refresh_page_list()
         self.translation_view.refresh(self.project.document)
         self._refresh_preview()
@@ -584,6 +883,12 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.translation_view.set_busy(False)
         self.structure_widget.setEnabled(True)
+        self.override_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self.parse_button.setEnabled(True)
+        self.reparse_button.setEnabled(True)
+        self.retry_button.setEnabled(True)
+        self.override_combo.setEnabled(True)
         self.save_button.setEnabled(True)
         self.export_button.setEnabled(True)
         self.page_list.setEnabled(True)

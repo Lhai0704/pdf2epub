@@ -9,7 +9,8 @@ import pymupdf
 from pydantic import BaseModel, ConfigDict, Field
 
 from pdf2epub.domain.errors import SourceOpenError
-from pdf2epub.domain.models import NativeTextQuality
+from pdf2epub.domain.models import NativeTextQuality, PageClassification
+from pdf2epub.pdf.classifier import classify_page
 
 MAX_PAGES = 5_000
 MAX_PAGE_DIMENSION_POINTS = 20_000
@@ -22,6 +23,7 @@ class PageInspection(BaseModel):
     height: float
     rotation: int
     quality: NativeTextQuality
+    classification: PageClassification
 
 
 class PdfInspection(BaseModel):
@@ -96,11 +98,14 @@ class PdfAnalyzer:
             for line in block.get("lines", [])
             for span in line.get("spans", [])
         )
-        image_area = sum(
-            max(0.0, float(block["bbox"][2]) - float(block["bbox"][0]))
-            * max(0.0, float(block["bbox"][3]) - float(block["bbox"][1]))
-            for block in payload.get("blocks", [])
-            if block.get("type") == 1 and block.get("bbox")
+        image_area = max(
+            (
+                max(0.0, float(block["bbox"][2]) - float(block["bbox"][0]))
+                * max(0.0, float(block["bbox"][3]) - float(block["bbox"][1]))
+                for block in payload.get("blocks", [])
+                if block.get("type") == 1 and block.get("bbox")
+            ),
+            default=0.0,
         )
         rect = page.rect
         if (
@@ -112,10 +117,12 @@ class PdfAnalyzer:
             or rect.height > MAX_PAGE_DIMENSION_POINTS
         ):
             raise SourceOpenError("PDF page dimensions exceed the M1 safety limits")
+        quality = native_text_quality(text, image_area, rect.width * rect.height)
         return PageInspection(
             page_index=page_index,
             width=rect.width,
             height=rect.height,
             rotation=page.rotation,
-            quality=native_text_quality(text, image_area, rect.width * rect.height),
+            quality=quality,
+            classification=classify_page(quality, page.rotation),
         )
